@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Gravador de Portais Playwright — v1.1 — Python 3.10+ / Windows.
+"""Gravador de Portais Playwright — v1.2 — Python 3.10+ / Windows.
 
 INSTALAÇÃO (Prompt de Comando):
     py -m pip install playwright
@@ -63,14 +63,24 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit
 import uuid
 
-VERSION = '1.1'
+VERSION = '1.2'
+PDF_LIMIT = 50 * 1024 * 1024
+ZIP_MAX_BYTES = 256 * 1024 * 1024
+ZIP_MAX_ENTRIES = 10000
+ZIP_MAX_SECONDS = 30
+# Windows: MAX_PATH = 260 incluindo o terminador; margem para o prefixo uuid.
+WINDOWS_PATH_LIMIT = 250
+# Substrings de content-type tratadas como documento (XML de NF-e/CT-e, planilhas, ZIP etc.).
+DOCUMENT_MIME_PARTS = ('application/pdf', 'text/csv', 'text/plain', 'octet-stream', 'zip',
+                       'application/xml', 'text/xml', 'ms-excel', 'spreadsheetml',
+                       'wordprocessingml', 'msword')
 
 # Executado em cada documento e iframe, inclusive os criados posteriormente.
 JS = r"""(() => {
 if (window.__portalRecorder) return;
 window.__portalRecorder = true;
 let enabled = false, serial = 0, lastFocus = null, pendingTab = null;
-let lastPointer = null, activation = null;
+let lastPointer = null, activation = null, labelClick = null;
 const documentId = Math.random().toString(36).slice(2);
 const dirty = new Set(); let values = new WeakMap();
 const clip = x => String(x || '').replace(/\s+/g, ' ').trim().slice(0, 240);
@@ -81,7 +91,7 @@ function path(el) {
  const parts = [];
  while (el && el.nodeType === 1 && parts.length < 12) {
   let s = el.localName;
-  if (el.id) { parts.unshift('#' + CSS.escape(el.id)); break; }
+  if (el.id && !dynamicId(el.id)) { parts.unshift('#' + CSS.escape(el.id)); break; }
   const parent = el.parentElement;
   if (parent) {
    const same = [...parent.children].filter(x => x.localName === el.localName);
@@ -117,13 +127,15 @@ function describe(el) {
  const add = (kind, value, extra = {}) => {
   if (!value) return;
   const item = {kind, value, ...extra};
-  if (kind === 'css') {
-   try { item.matches = root.querySelectorAll(value).length; }
-   catch (_) { item.matches = -1; }
-  }
+  if (kind === 'css') item.matches = count(value);
   candidates.push(item);
  };
- if (el.getAttribute('data-testid')) add('test_id', el.getAttribute('data-testid'));
+ const count = selector => {
+  try { return root.querySelectorAll(selector).length; }
+  catch (_) { return -1; }
+ };
+ const testId = el.getAttribute('data-testid');
+ if (testId) add('test_id', testId, {matches:count('[data-testid="' + CSS.escape(testId) + '"]')});
  if (el.id) add('css', '#' + CSS.escape(el.id), {dynamic:dynamicId(el.id), fragile:dynamicId(el.id)});
  const label = clip(el.labels && [...el.labels].map(x => x.textContent).join(' '));
  if (label) add('label', label);
@@ -132,10 +144,11 @@ function describe(el) {
  const text = secret ? '' : clip(el.innerText || (['button','submit','reset'].includes(el.type) ? el.value : ''));
  if (role && (aria || text)) add('role', role, {name: aria || text, heuristic: true});
  if (el.getAttribute('name')) add('css', el.localName + '[name=' + JSON.stringify(el.getAttribute('name')) + ']');
- if (el.placeholder && !secret) add('placeholder', el.placeholder);
+ if (el.placeholder && !secret) add('placeholder', el.placeholder, {matches:count('[placeholder="' + CSS.escape(el.placeholder) + '"]')});
  if (text && text.length < 150) add('text', text);
  add('css', path(el), {fragile: true});
- const rank = c => c.fragile ? 90 : ({test_id:0,label:1,role:2,placeholder:3,css:4,text:5}[c.kind] ?? 50);
+ // Candidatos que correspondem a mais de um elemento descem abaixo dos únicos.
+ const rank = c => c.fragile ? 90 : ({test_id:0,label:1,role:2,placeholder:3,css:4,text:5}[c.kind] ?? 50) + (c.matches > 1 ? 10 : 0);
  candidates.sort((a,b) => rank(a)-rank(b));
  const hosts = []; let r = root;
  while (r && r.host) { hosts.unshift(path(r.host)); r = r.host.getRootNode(); }
@@ -165,7 +178,7 @@ function flushOne(el) {
 window.__flushPortal = () => { for (const el of dirty) flushOne(el); };
 window.__setPortalRecording = state => {
  if (!state) window.__flushPortal();
- enabled = !!state; dirty.clear(); valuesReset(); pendingTab = null; lastPointer = null; activation = null;
+ enabled = !!state; dirty.clear(); valuesReset(); pendingTab = null; lastPointer = null; activation = null; labelClick = null;
 };
 function valuesReset() { lastFocus = null; values = new WeakMap(); }
 window.__recordPortal({kind:'recorder_ready'}).then(state => {enabled = !!state;}).catch(() => {});
@@ -186,43 +199,53 @@ document.addEventListener('change', e => {
 document.addEventListener('pointerdown', e => {
  if (!enabled) return;
  window.__flushPortal();
- const el = control(e);
- const id = emit('pointer_down', {element:describe(el),actual_target:describe(target(e)),
+ const el = control(e), info = describe(el);
+ const id = emit('pointer_down', {element:info,actual_target:describe(target(e)),
   is_trusted:e.isTrusted,button:e.button,x:e.clientX,y:e.clientY,replay_hint:'context_only'});
- lastPointer = {id,at:performance.now(),element:describe(el)};
+ lastPointer = {id,at:performance.now(),element:info};
  activation = null;
 }, true);
 document.addEventListener('click', e => {
+ if (!enabled) return;
  window.__flushPortal();
  const el = control(e);
  const linkedKey = e.detail === 0 && activation && activation.el === el &&
   performance.now()-activation.at < 1500 ? activation.id : null;
- emit('click', {element:describe(el), actual_target:describe(target(e)),
-  is_trusted:e.isTrusted, generated_by_key:linkedKey,
-  pointer_id:lastPointer && performance.now()-lastPointer.at < 2000 ? lastPointer.id : null,
-  pointer_element:lastPointer && performance.now()-lastPointer.at < 2000 ? lastPointer.element : null,
-  replay_hint:linkedKey ? 'effect_of_key_do_not_repeat' : (!e.isTrusted ? 'script_generated_review' : 'action'),
+ // Clique no <label> é repassado pelo navegador ao controle associado.
+ const linkedLabel = !linkedKey && labelClick && labelClick.control === el &&
+  performance.now()-labelClick.at < 1000 ? labelClick.id : null;
+ const recent = lastPointer && performance.now()-lastPointer.at < 2000;
+ const id = emit('click', {element:describe(el), actual_target:describe(target(e)),
+  is_trusted:e.isTrusted, generated_by_key:linkedKey, generated_by_label:linkedLabel,
+  pointer_id:recent ? lastPointer.id : null,
+  pointer_element:recent ? lastPointer.element : null,
+  replay_hint:linkedKey ? 'effect_of_key_do_not_repeat' : (linkedLabel ? 'effect_of_label_do_not_repeat' :
+   (!e.isTrusted ? 'script_generated_review' : 'action')),
   button:e.button,detail:e.detail,x:e.clientX,y:e.clientY,
   modifiers:{ctrl:e.ctrlKey,alt:e.altKey,shift:e.shiftKey,meta:e.metaKey}});
  if (linkedKey) activation = null;
+ labelClick = el?.localName === 'label' && el.control ? {id,control:el.control,at:performance.now()} : null;
 }, true);
-document.addEventListener('dblclick', e => emit('double_click', {element:describe(target(e))}), true);
-document.addEventListener('contextmenu', e => emit('context_menu', {element:describe(target(e))}), true);
+document.addEventListener('dblclick', e => { if (enabled) emit('double_click', {element:describe(target(e))}); }, true);
+document.addEventListener('contextmenu', e => { if (enabled) emit('context_menu', {element:describe(target(e))}); }, true);
 document.addEventListener('keydown', e => {
  if (!enabled) return;
- const el = target(e);
+ // Preenchimento automático do Chrome dispara keydown sem e.key.
+ const el = target(e), key = typeof e.key === 'string' ? e.key : '';
+ if (!key) return;
  // Não captura caracteres digitados nem atalhos dentro de campos protegidos.
- if (sensitive(el) && !['Tab','Enter','Escape'].includes(e.key)) return;
- if (e.key.length === 1 && !(e.key === ' ' && el?.matches('button,[role="button"],input[type="checkbox"]')) && !e.ctrlKey && !e.altKey && !e.metaKey) return;
- if (['Shift','Control','Alt','Meta'].includes(e.key)) return;
+ if (sensitive(el) && !['Tab','Enter','Escape'].includes(key)) return;
+ if (key.length === 1 && !(key === ' ' && el?.matches('button,[role="button"],input[type="checkbox"]')) && !e.ctrlKey && !e.altKey && !e.metaKey) return;
+ if (['Shift','Control','Alt','Meta'].includes(key)) return;
  window.__flushPortal();
  const keyId = documentId + ':' + (serial + 1);
- emit('key', {key_id:keyId,is_trusted:e.isTrusted,key:e.key,code:e.code,repeat:e.repeat,element:describe(el),
+ emit('key', {key_id:keyId,is_trusted:e.isTrusted,key,code:e.code,repeat:e.repeat,element:describe(el),
   modifiers:{ctrl:e.ctrlKey,alt:e.altKey,shift:e.shiftKey,meta:e.metaKey}});
- if (['Enter',' '].includes(e.key)) activation = {id:keyId,el:control(e),at:performance.now()};
- if (e.key === 'Tab') pendingTab = {key_id:keyId, from:describe(el), at:performance.now()};
+ if (['Enter',' '].includes(key)) activation = {id:keyId,el:control(e),at:performance.now()};
+ if (key === 'Tab') pendingTab = {key_id:keyId, from:describe(el), at:performance.now()};
 }, true);
 document.addEventListener('focusin', e => {
+ if (!enabled) return;
  const current = describe(target(e));
  emit('focus', {from:lastFocus,to:current}); lastFocus = current;
  if (pendingTab && performance.now() - pendingTab.at < 2000) {
@@ -230,13 +253,17 @@ document.addEventListener('focusin', e => {
  }
  pendingTab = null;
 }, true);
-document.addEventListener('submit', e => {window.__flushPortal(); emit('submit',{element:describe(target(e))});}, true);
-let scrollTimer;
+document.addEventListener('submit', e => {if (!enabled) return; window.__flushPortal(); emit('submit',{element:describe(target(e))});}, true);
+// Um temporizador por contêiner: rolagens simultâneas não se sobrescrevem.
+const scrollTimers = new WeakMap();
 document.addEventListener('scroll', e => {
- const el = target(e);
- clearTimeout(scrollTimer);
- scrollTimer = setTimeout(() => emit('scroll',{element:describe(el),
-  x:el ? el.scrollLeft : scrollX,y:el ? el.scrollTop : scrollY}), 250);
+ if (!enabled) return;
+ const el = target(e), key = el || document;
+ clearTimeout(scrollTimers.get(key));
+ scrollTimers.set(key, setTimeout(() => {
+  scrollTimers.delete(key);
+  emit('scroll',{element:describe(el), x:el ? el.scrollLeft : scrollX,y:el ? el.scrollTop : scrollY});
+ }, 250));
 }, true);
 window.addEventListener('beforeunload', () => window.__flushPortal());
 window.addEventListener('beforeprint', () => emit('print_requested'));
@@ -260,8 +287,15 @@ def safe_url(url):
         return '[URL inválida]'
 
 
-def safe_name(name):
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(' .')[:160]
+def safe_name(name, max_len=160):
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(' .')
+    if len(name) > max_len:
+        # Trunca o nome preservando a extensão.
+        stem, dot, ext = name.rpartition('.')
+        if dot and stem and len(ext) <= 10:
+            name = stem[:max_len - len(ext) - 1].rstrip(' .') + '.' + ext
+        else:
+            name = name[:max_len].rstrip(' .')
     if name.split('.')[0].upper() in {'CON','PRN','AUX','NUL', *('COM'+str(i) for i in range(1,10)), *('LPT'+str(i) for i in range(1,10))}:
         name = '_' + name
     return name or 'documento'
@@ -288,7 +322,7 @@ def inspect_zip(path):
             result['zip_members'] = [{'name':i.filename, 'bytes':i.file_size, 'compressed_bytes':i.compress_size} for i in items[:1000]]
             result['zip_members_truncated'] = len(items) > 1000
             result['zip_total_members'] = len(items)
-            if len(items) > 10000 or sum(i.file_size for i in items) > 256*1024*1024:
+            if len(items) > ZIP_MAX_ENTRIES or sum(i.file_size for i in items) > ZIP_MAX_BYTES:
                 result['validation'] = 'ZIP_LIMITE_VERIFICACAO'
             elif any(i.flag_bits & 1 for i in items):
                 result['validation'] = 'ZIP_CRIPTOGRAFADO'
@@ -306,7 +340,7 @@ def inspect_zip(path):
                             if not block:
                                 break
                             total += len(block)
-                            if total > 256*1024*1024 or time.monotonic()-started > 30:
+                            if total > ZIP_MAX_BYTES or time.monotonic()-started > ZIP_MAX_SECONDS:
                                 result['validation'] = 'ZIP_LIMITE_VERIFICACAO'
                                 return result
                 result['validation'] = 'ZIP_CRC_OK'
@@ -344,9 +378,17 @@ def export_session(folder):
     events, invalid = [], 0
     with (folder / 'eventos.jsonl').open(encoding='utf-8') as f:
         for line in f:
+            if not line.strip():
+                continue
             try:
-                events.append(json.loads(line))
+                item = json.loads(line)
             except json.JSONDecodeError:
+                invalid += 1
+                continue
+            # Linha JSON válida, mas sem estrutura de evento, também é descartada.
+            if isinstance(item, dict) and isinstance(item.get('kind'), str):
+                events.append(item)
+            else:
                 invalid += 1
     recorded_version = next((e.get('version', VERSION) for e in events if e.get('kind') == 'session_started'), VERSION)
     result = {'version': recorded_version, 'exporter_version': VERSION, 'invalid_lines': invalid, 'events': events}
@@ -367,7 +409,7 @@ def export_session(folder):
             row['zip_members'] = json.dumps(e.get('zip_members', []), ensure_ascii=False)
             rows.append(row)
     def csv_cell(value):
-        if isinstance(value,str) and value.lstrip().startswith(('=','+','-','@')):
+        if isinstance(value,str) and (value.startswith(('\t','\r')) or value.lstrip().startswith(('=','+','-','@'))):
             return "'" + value
         return value
     with (folder / 'downloads.csv').open('w', encoding='utf-8-sig', newline='') as f:
@@ -391,7 +433,7 @@ def export_session(folder):
         detail = e.get('file') or e.get('url') or e.get('note') or ''
         if kind == 'key':
             mods = e.get('modifiers',{})
-            detail = '+'.join([name for key,name in [('ctrl','Ctrl'),('alt','Alt'),('shift','Shift'),('meta','Meta')] if mods.get(key)] + [e['key']]) + ' → ' + element_name(e.get('element'))
+            detail = '+'.join([name for key,name in [('ctrl','Ctrl'),('alt','Alt'),('shift','Shift'),('meta','Meta')] if mods.get(key)] + [str(e.get('key',''))]) + ' → ' + element_name(e.get('element'))
         elif kind == 'tab_destination':
             detail = element_name(e.get('from')) + ' → ' + element_name(e.get('to'))
         elif kind == 'focus':
@@ -488,10 +530,14 @@ class Recorder:
         if len(self.event_ids) > 10000:
             self.event_ids.pop(next(iter(self.event_ids)))
         generated_key = payload.get('generated_by_key')
+        generated_label = payload.get('generated_by_label')
         if generated_key:
             self.event('action_relation', page=self.page_id(page), source_event=self.event_ids.get(generated_key),
                        effect_event=number, note='Clique resultante do teclado; não reproduzir ambos.')
-        if kind in ('click', 'key', 'select') and payload.get('is_trusted',True) and not generated_key:
+        elif generated_label:
+            self.event('action_relation', page=self.page_id(page), source_event=self.event_ids.get(generated_label),
+                       effect_event=number, note='Clique repassado pelo label; não reproduzir ambos.')
+        if kind in ('click', 'key', 'select') and payload.get('is_trusted',True) and not generated_key and not generated_label:
             self.last_action[page] = (number, time.monotonic())
         return True
 
@@ -500,22 +546,21 @@ class Recorder:
         if not active:
             await self.flush()
         self.active = active
-        for page in list(self.context.pages):
-            for frame in page.frames:
-                try:
-                    await frame.evaluate('(v) => window.__setPortalRecording && window.__setPortalRecording(v)', active)
-                except Exception:
-                    pass  # frame pode desaparecer durante navegação
+        await self.evaluate_frames('(v) => window.__setPortalRecording && window.__setPortalRecording(v)', active)
         self.event('recording_started' if active else 'recording_paused')
         self.updates.put(('state', 'GRAVANDO' if active else 'PAUSADO'))
 
+    async def evaluate_frames(self, script, arg=None):
+        async def one(frame):
+            try:
+                await frame.evaluate(script, arg)
+            except Exception:
+                pass  # frame pode desaparecer durante navegação
+        frames = [frame for page in list(self.context.pages) for frame in page.frames]
+        await asyncio.gather(*(one(frame) for frame in frames))
+
     async def flush(self):
-        for page in list(self.context.pages):
-            for frame in page.frames:
-                try:
-                    await frame.evaluate('() => window.__flushPortal && window.__flushPortal()')
-                except Exception:
-                    pass
+        await self.evaluate_frames('() => window.__flushPortal && window.__flushPortal()')
         await asyncio.sleep(0.1)
 
     def attach(self, page):
@@ -565,12 +610,14 @@ class Recorder:
             return
         meta = meta or {'stage':self.stage, 'trigger_candidate':self.trigger(page), 'started':time.monotonic()}
         mime = response.headers.get('content-type', '').split(';')[0].strip().lower()
-        if any(x in mime for x in ('application/pdf', 'text/csv', 'text/plain', 'octet-stream', 'zip')):
+        attachment = response.headers.get('content-disposition', '').strip().lower().startswith('attachment')
+        if attachment or any(x in mime for x in DOCUMENT_MIME_PARTS):
             self.event('document_response', page=self.page_id(page), stage=meta['stage'], url=safe_url(response.url),
-                       status=response.status, mime=mime, trigger_candidate=meta['trigger_candidate'],
+                       status=response.status, mime=mime, attachment=attachment, trigger_candidate=meta['trigger_candidate'],
                        response_wait_s=round(time.monotonic()-meta['started'],3),
                        note='Resposta observada; consulte capture_finished/download_finished para arquivo salvo.')
-        elif response.status >= 400:
+        elif response.status >= 400 and response.request.resource_type in ('document', 'xhr', 'fetch'):
+            # Ignora 4xx/5xx de imagens, fontes e scripts de terceiros.
             self.event('http_error', page=self.page_id(page), url=safe_url(response.url), status=response.status)
         if self.config.get('capture_pdf', True) and mime == 'application/pdf' and response.status == 200 and response.url.startswith(('http://','https://')):
             self.spawn(self.capture_response(page, response, meta))
@@ -598,7 +645,7 @@ class Recorder:
                 'method':'response_pdf', 'trigger_candidate':request_meta['trigger_candidate'], 'url':safe_url(response.url)}
         self.event('capture_started', **meta, file=name)
         try:
-            limit = 50*1024*1024
+            limit = PDF_LIMIT
             length = response.headers.get('content-length','')
             if length.isdigit() and int(length)>limit:
                 raise ValueError('PDF excede limite de captura de 50 MiB')
@@ -629,19 +676,19 @@ class Recorder:
             if candidate is None or candidate.is_closed():
                 continue
             try:
-                encoded = await asyncio.wait_for(candidate.evaluate("""async url => {
+                encoded = await asyncio.wait_for(candidate.evaluate("""async ({url, limit}) => {
                     if (!url.startsWith('blob:')) throw new Error('Somente blob local');
                     const response = await fetch(url);
                     if (!response.ok) throw new Error('Falha ao ler blob');
                     const blob = await response.blob();
-                    if (blob.size > 50*1024*1024) throw new Error('Blob excede 50 MiB');
+                    if (blob.size > limit) throw new Error('Blob excede 50 MiB');
                     return await new Promise((resolve,reject) => {
                         const reader = new FileReader();
                         reader.onload = () => resolve(reader.result.split(',')[1]);
                         reader.onerror = () => reject(new Error('Falha FileReader'));
                         reader.readAsDataURL(blob);
                     });
-                }""", url), timeout=15)
+                }""", {'url': url, 'limit': PDF_LIMIT}), timeout=15)
                 data = base64.b64decode(encoded, validate=True)
                 if b'%PDF-' not in data[:1024]:
                     raise ValueError('Blob não contém assinatura PDF')
@@ -656,8 +703,10 @@ class Recorder:
 
     async def download(self, page, download):
         started = time.monotonic()
-        name = uuid.uuid4().hex[:10] + '_' + safe_name(download.suggested_filename)
-        path = self.folder / 'downloads' / name
+        folder = self.folder / 'downloads'
+        budget = max(40, min(160, WINDOWS_PATH_LIMIT - len(str(folder.resolve())) - 12))
+        name = uuid.uuid4().hex[:10] + '_' + safe_name(download.suggested_filename, budget)
+        path = folder / name
         meta = {'attempt_id':uuid.uuid4().hex, 'page':self.page_id(page), 'stage':self.stage,
                 'method':'download', 'trigger_candidate':self.trigger(page), 'url':safe_url(download.url)}
         self.event('download_started', **meta, file=name)
@@ -776,7 +825,7 @@ def gui():
     from tkinter.scrolledtext import ScrolledText
 
     root = tk.Tk()
-    root.title('Gravador de Portais • Playwright 1.1')
+    root.title('Gravador de Portais • Playwright ' + VERSION)
     root.geometry('1050x770')
     commands, updates = queue.Queue(), queue.Queue()
     worker = None
@@ -806,7 +855,7 @@ def gui():
     field(5, 'password_selector', 'CSS da senha')
     field(6, 'submit_selector', 'CSS do botão Entrar')
     capture_pdf = tk.BooleanVar(value=True)
-    ttk.Checkbutton(panel, text='Capturar PDFs recebidos pela página e tentar recuperar PDFs blob (até 50 MiB)', variable=capture_pdf).grid(row=7, column=0, columnspan=3, sticky='w', pady=6)
+    ttk.Checkbutton(panel, text=f'Capturar PDFs recebidos pela página e tentar recuperar PDFs blob (até {PDF_LIMIT // (1024*1024)} MiB)', variable=capture_pdf).grid(row=7, column=0, columnspan=3, sticky='w', pady=6)
     buttons = ttk.Frame(panel)
     buttons.grid(row=8, column=0, columnspan=3, sticky='w', pady=8)
     controls = []
@@ -902,6 +951,9 @@ def main():
     parser.add_argument('--recuperar', type=Path, help='Regenera relatórios a partir de eventos.jsonl de uma sessão encerrada')
     args = parser.parse_args()
     if args.recuperar:
+        if not (args.recuperar / 'eventos.jsonl').is_file():
+            print(f'Arquivo eventos.jsonl não encontrado em: {args.recuperar}')
+            sys.exit(1)
         print(f'{export_session(args.recuperar)} eventos recuperados.')
         return
     try:
