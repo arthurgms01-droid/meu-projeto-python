@@ -62,16 +62,22 @@ Configurações opcionais (.env ou variáveis de ambiente):
     BAIXAR_BOLETO_NF=0                   1 = baixa também Boleto e Nota Fiscal
     EXTRAIR_ZIP_ANALITICO=1              extrai e remove o .zip; 0 = mantém apenas o .zip
     TIMEOUT_DOWNLOAD_ANALITICO_MS=60000  espera máxima por arquivo
+    WORKERS_PARALELOS=1                  janelas do navegador trabalhando ao mesmo tempo
+    INTERVALO_INICIO_WORKERS_SEG=5       intervalo entre a abertura de cada janela
+    PULAR_CONTRATO_CONCLUIDO=1           0 = sempre reabre contratos já concluídos
 """
 
 import csv
 import ctypes
 import getpass
+import builtins
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
+import threading
 import time
 import zipfile
 from contextlib import contextmanager
@@ -160,6 +166,30 @@ LOGIN_SENHA_PADRAO = ""
 # --- FIM INSERÇÃO CREDENCIAIS E CONFIGURAÇÕES VIA .ENV ---
 
 
+# --- INÍCIO INSERÇÃO EXECUÇÃO PARALELA (INFRAESTRUTURA) ---
+# Trava única para os arquivos de log compartilhados (controle TXT, CSVs de
+# tempos/rastreamento/diagnóstico, logs de erro). Reentrante porque algumas
+# gravações inicializam o arquivo dentro da própria gravação.
+TRAVA_ARQUIVOS = threading.RLock()
+TRAVA_CONSOLE = threading.Lock()
+_contexto_thread = threading.local()
+
+
+def print(*args, **kwargs):
+    """
+    Substitui o print deste módulo: com mais de uma janela em paralelo, cada
+    linha do console sai inteira e com o prefixo da janela ([W1], [W2]...).
+    Com uma única janela não há prefixo e a saída fica igual à anterior.
+    """
+    prefixo = getattr(_contexto_thread, "prefixo", "")
+    with TRAVA_CONSOLE:
+        if prefixo:
+            builtins.print(prefixo, *args, **kwargs)
+        else:
+            builtins.print(*args, **kwargs)
+# --- FIM INSERÇÃO EXECUÇÃO PARALELA (INFRAESTRUTURA) ---
+
+
 # --- INÍCIO INSERÇÃO PLAYWRIGHT (CLASSE MANTENDO FLUXO ORIGINAL) ---
 class HapvidaNDIAnaliticosAutomation:
     TIPO_CARNET = "CARNET COMPLEMENTAR-COPARTICIPACAO"
@@ -183,6 +213,23 @@ class HapvidaNDIAnaliticosAutomation:
         ("ANALITICO_PDF", "Analítico PDF"),
     )
     # --- FIM INSERÇÃO ESCOPO DE DOWNLOAD: RELATÓRIOS ANALÍTICOS ---
+
+    # --- INÍCIO INSERÇÃO CONFIRMAÇÃO PRECISA DAS TELAS ---
+    # Os seletores antigos (//*[contains(., 'texto')]) casavam com o próprio
+    # <html>, cujo texto inclui elementos ocultos e a tela anterior; a espera
+    # terminava antes de a tela mudar. Estes miram o botão/aba que só existe
+    # na tela de destino, e "visible=true" faz o Playwright usar o primeiro
+    # elemento visível (wait_for_selector avalia só o primeiro que casar).
+    SELETOR_TELA_CONTRATO = (
+        "xpath=//*[self::button or @role='button' or @role='tab']"
+        "[contains(normalize-space(.), 'Extrato')] >> visible=true"
+    )
+    SELETOR_TELA_EXTRATO = (
+        "xpath=//*[self::button or @role='button' or @role='tab']"
+        "[contains(normalize-space(.), 'Em Aberto') or contains(normalize-space(.), 'Histórico')"
+        " or contains(normalize-space(.), 'Historico')] >> visible=true"
+    )
+    # --- FIM INSERÇÃO CONFIRMAÇÃO PRECISA DAS TELAS ---
 
     TIMEOUT_CURTO = 5_000
     TIMEOUT_PADRAO = 20_000
@@ -352,9 +399,21 @@ class HapvidaNDIAnaliticosAutomation:
             "ANALITICO_TXT": 0,
             "ANALITICO_PDF": 0,
             "arquivos_extraidos_zip": 0,
+            "contratos_pulados_concluidos": 0,
         }
         self.inicializar_controle_txt()
         self.documentos_ok_controle = self.carregar_documentos_ok_controle()
+
+        # --- INÍCIO INSERÇÃO PULAR CONTRATO JÁ CONCLUÍDO ---
+        # Marcador por contrato + vencimento + escopo de documentos, gravado só
+        # quando o contrato termina com todos os documentos OK. Com ele o robô
+        # nem pesquisa o contrato numa nova execução da mesma planilha.
+        self.pular_contrato_concluido = os.getenv(
+            "PULAR_CONTRATO_CONCLUIDO", "1"
+        ).strip().lower() in {"1", "true", "sim", "s"}
+        self.arquivo_contratos_concluidos = self.logs_dir / "contratos_concluidos_analiticos_ndi.txt"
+        self.contratos_concluidos = self.carregar_contratos_concluidos()
+        # --- FIM INSERÇÃO PULAR CONTRATO JÁ CONCLUÍDO ---
         # --- FIM INSERÇÃO CONTROLE TXT / NÃO ALTERAR EXCEL ORIGINAL ---
 
         self.playwright = None
@@ -368,6 +427,25 @@ class HapvidaNDIAnaliticosAutomation:
         self.modo_rapido = os.getenv("MODO_RAPIDO", "1").strip().lower() in {"1", "true", "sim", "s"}
         self.tempos_contratos = []
         # --- FIM INSERÇÃO MODO RÁPIDO COM SESSÃO REUTILIZÁVEL ---
+
+        # --- INÍCIO INSERÇÃO EXECUÇÃO PARALELA ---
+        # WORKERS_PARALELOS=1 mantém o comportamento sequencial. Com 2 ou mais,
+        # cada janela tem navegador e login próprios e retira contratos de uma
+        # fila comum, de modo que nenhuma linha da planilha é processada duas vezes.
+        self.quantidade_workers = max(1, int(os.getenv("WORKERS_PARALELOS", "1")))
+        self.intervalo_inicio_workers = max(
+            0.0,
+            float(os.getenv("INTERVALO_INICIO_WORKERS_SEG", "5").replace(",", ".")),
+        )
+        self.modo_worker = False
+        self.numero_worker = 0
+        self.fila_linhas = None
+        self.df_contratos_preparado = None
+        self.progresso_paralelo = None
+        self.evento_parada = None
+        self.contratos_finalizados = 0
+        self.indices_processados = []
+        # --- FIM INSERÇÃO EXECUÇÃO PARALELA ---
 
         # --- INÍCIO INSERÇÃO CRONOMETRAGEM DETALHADA ---
         self.tempos_etapas = []
@@ -473,7 +551,7 @@ class HapvidaNDIAnaliticosAutomation:
     def inicializar_arquivo_tempos(self):
         try:
             if not self.arquivo_tempos_csv.exists():
-                with open(self.arquivo_tempos_csv, "w", newline="", encoding="utf-8-sig") as f:
+                with TRAVA_ARQUIVOS, open(self.arquivo_tempos_csv, "w", newline="", encoding="utf-8-sig") as f:
                     writer = csv.writer(f, delimiter=";")
                     writer.writerow([
                         "DATA_HORA", "CONTRATO", "VENCIMENTO", "TIPO_FATURA",
@@ -498,7 +576,7 @@ class HapvidaNDIAnaliticosAutomation:
         self.tempos_etapas.append(registro)
         try:
             self.inicializar_arquivo_tempos()
-            with open(self.arquivo_tempos_csv, "a", newline="", encoding="utf-8-sig") as f:
+            with TRAVA_ARQUIVOS, open(self.arquivo_tempos_csv, "a", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f, delimiter=";")
                 writer.writerow([
                     registro["data_hora"], registro["contrato"], registro["vencimento"],
@@ -597,7 +675,7 @@ class HapvidaNDIAnaliticosAutomation:
         if registro in self.downloads_concluidos:
             return
         self.downloads_concluidos.add(registro)
-        with open(self.log_file, "a", encoding="utf-8") as f:
+        with TRAVA_ARQUIVOS, open(self.log_file, "a", encoding="utf-8") as f:
             f.write(registro + "\n")
 
     def montar_chave_log_doc(self, contrato, vencimento, tipo_fatura, documento):
@@ -658,7 +736,7 @@ class HapvidaNDIAnaliticosAutomation:
     def inicializar_controle_txt(self):
         try:
             if not self.controle_txt_file.exists():
-                with open(self.controle_txt_file, "w", encoding="utf-8") as f:
+                with TRAVA_ARQUIVOS, open(self.controle_txt_file, "w", encoding="utf-8") as f:
                     f.write("|".join(self.controle_txt_cabecalho) + "\n")
                 print(f"Controle TXT criado: {self.controle_txt_file}")
         except Exception as e:
@@ -699,6 +777,58 @@ class HapvidaNDIAnaliticosAutomation:
 
         print(f"Documentos já baixados carregados do controle TXT: {len(documentos_ok)}")
         return documentos_ok
+
+    # --- INÍCIO INSERÇÃO PULAR CONTRATO JÁ CONCLUÍDO ---
+    def montar_chave_contrato_concluido(self, contrato, vencimento):
+        """
+        Contrato + vencimento + documentos do escopo atual. Se o escopo mudar
+        (ex.: FORMATOS_ANALITICOS ou BAIXAR_BOLETO_NF), a chave muda e o
+        contrato volta a ser processado.
+        """
+        escopo = ",".join(sorted(self.DOCUMENTOS_PERMITIDOS))
+        return (
+            self.limpar_campo_txt(contrato).upper(),
+            self.limpar_campo_txt(vencimento),
+            escopo,
+        )
+
+    def carregar_contratos_concluidos(self):
+        concluidos = set()
+        try:
+            if self.arquivo_contratos_concluidos.exists():
+                with open(self.arquivo_contratos_concluidos, "r", encoding="utf-8") as f:
+                    for linha in f:
+                        partes = linha.rstrip("\n").split("|")
+                        if len(partes) < 3 or partes[0] == "Contrato":
+                            continue
+                        concluidos.add((partes[0].strip().upper(), partes[1].strip(), partes[2].strip()))
+        except Exception as e:
+            print(f"[AVISO] Não foi possível carregar os contratos concluídos: {e}")
+        print(f"Contratos já concluídos carregados: {len(concluidos)}")
+        return concluidos
+
+    def contrato_ja_concluido(self, contrato, vencimento):
+        if not self.pular_contrato_concluido:
+            return False
+        return self.montar_chave_contrato_concluido(contrato, vencimento) in self.contratos_concluidos
+
+    def registrar_contrato_concluido(self, contrato, vencimento):
+        chave = self.montar_chave_contrato_concluido(contrato, vencimento)
+        if chave in self.contratos_concluidos:
+            return
+        self.contratos_concluidos.add(chave)
+        try:
+            with TRAVA_ARQUIVOS:
+                novo = not self.arquivo_contratos_concluidos.exists()
+                with open(self.arquivo_contratos_concluidos, "a", encoding="utf-8") as f:
+                    if novo:
+                        f.write("Contrato|Vencimento|Documentos|Data/hora\n")
+                    f.write(
+                        "|".join(list(chave) + [datetime.now().strftime("%d/%m/%Y %H:%M:%S")]) + "\n"
+                    )
+        except Exception as e:
+            print(f"[AVISO] Não foi possível registrar o contrato concluído: {e}")
+    # --- FIM INSERÇÃO PULAR CONTRATO JÁ CONCLUÍDO ---
 
     def limpar_campo_txt(self, valor):
         texto = str(valor or "").replace("\r", " ").replace("\n", " ").replace("|", "/")
@@ -850,7 +980,7 @@ class HapvidaNDIAnaliticosAutomation:
 
         try:
             self.inicializar_controle_txt()
-            with open(self.controle_txt_file, "a", encoding="utf-8") as f:
+            with TRAVA_ARQUIVOS, open(self.controle_txt_file, "a", encoding="utf-8") as f:
                 f.write("|".join(linha) + "\n")
             print(f"Linha adicionada ao controle TXT: {self.controle_txt_file.name}")
         except Exception as e:
@@ -954,6 +1084,7 @@ class HapvidaNDIAnaliticosAutomation:
         print(f"Contratos com sucesso completo: {self.resumo_execucao['contratos_sucesso']}")
         print(f"Contratos com sucesso parcial/pendência: {self.resumo_execucao['contratos_pendencia']}")
         print(f"Contratos com erro: {self.resumo_execucao['contratos_erro']}")
+        print(f"Contratos pulados (já concluídos antes): {self.resumo_execucao.get('contratos_pulados_concluidos', 0)}")
         print(f"Faturas processadas: {self.resumo_execucao['faturas_processadas']}")
         print(f"Arquivos baixados nesta execução: {self.resumo_execucao['arquivos_baixados']}")
         print(f"Arquivos pulados por duplicidade: {self.resumo_execucao['arquivos_pulados']}")
@@ -979,7 +1110,7 @@ class HapvidaNDIAnaliticosAutomation:
     def inicializar_arquivo_diagnosticos(self):
         try:
             if not self.arquivo_diagnosticos_csv.exists():
-                with open(self.arquivo_diagnosticos_csv, "w", newline="", encoding="utf-8-sig") as f:
+                with TRAVA_ARQUIVOS, open(self.arquivo_diagnosticos_csv, "w", newline="", encoding="utf-8-sig") as f:
                     writer = csv.writer(f, delimiter=";")
                     writer.writerow([
                         "DATA_HORA", "CONTRATO", "VENCIMENTO", "TIPO_FATURA",
@@ -1377,7 +1508,7 @@ class HapvidaNDIAnaliticosAutomation:
 
         try:
             self.inicializar_arquivo_diagnosticos()
-            with open(self.arquivo_diagnosticos_csv, "a", newline="", encoding="utf-8-sig") as f:
+            with TRAVA_ARQUIVOS, open(self.arquivo_diagnosticos_csv, "a", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f, delimiter=";")
                 ativo = estado.get("elemento_ativo", {}) or {}
                 writer.writerow([
@@ -1492,7 +1623,7 @@ class HapvidaNDIAnaliticosAutomation:
     def inicializar_arquivo_rastreamento(self):
         try:
             if not self.arquivo_rastreamento_csv.exists():
-                with open(self.arquivo_rastreamento_csv, "w", newline="", encoding="utf-8-sig") as f:
+                with TRAVA_ARQUIVOS, open(self.arquivo_rastreamento_csv, "w", newline="", encoding="utf-8-sig") as f:
                     writer = csv.writer(f, delimiter=";")
                     writer.writerow([
                         "DATA_HORA", "CONTRATO", "VENCIMENTO", "TIPO_FATURA",
@@ -1551,7 +1682,7 @@ class HapvidaNDIAnaliticosAutomation:
 
         try:
             self.inicializar_arquivo_rastreamento()
-            with open(self.arquivo_rastreamento_csv, "a", newline="", encoding="utf-8-sig") as f:
+            with TRAVA_ARQUIVOS, open(self.arquivo_rastreamento_csv, "a", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f, delimiter=";")
                 writer.writerow([
                     datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
@@ -1578,7 +1709,7 @@ class HapvidaNDIAnaliticosAutomation:
     def registrar_erro(self, contexto, erro_msg):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         msg = self.resumir_erro(erro_msg)
-        with open(self.erros_log_file, "a", encoding="utf-8") as f:
+        with TRAVA_ARQUIVOS, open(self.erros_log_file, "a", encoding="utf-8") as f:
             f.write(f"[{timestamp}] CONTRATO: {self.contrato_atual} | {contexto} | ERRO: {msg}\n")
 
     def resumir_erro(self, erro):
@@ -2031,12 +2162,53 @@ class HapvidaNDIAnaliticosAutomation:
     def localizar_primeiro(self, descricao, seletores, page=None, timeout_por_selector=None, somente_visivel=True):
         page = page or self.page
         timeout_por_selector = timeout_por_selector or self.TIMEOUT_CURTO
+        estado = "visible" if somente_visivel else "attached"
 
+        # --- INÍCIO INSERÇÃO ESPERA SIMULTÂNEA DOS SELETORES ---
+        # Antes cada seletor era esperado em sequência (até timeout_por_selector
+        # cada um): se o primeiro não existisse, o robô ficava parado até o fim
+        # do prazo antes de tentar o próximo. Agora todos são esperados ao mesmo
+        # tempo e, assim que qualquer um aparece, vence o de maior prioridade
+        # (ordem da lista) que estiver disponível naquele momento. O prazo total
+        # é o mesmo de antes no pior caso (soma dos prazos individuais).
+        timeout_total = timeout_por_selector * max(1, len(seletores))
+        combinado = None
+        try:
+            for seletor in seletores:
+                locator = page.locator(seletor)
+                combinado = locator if combinado is None else combinado.or_(locator)
+        except Exception:
+            combinado = None
+
+        if combinado is not None:
+            try:
+                combinado.first.wait_for(state=estado, timeout=timeout_total)
+            except PlaywrightTimeoutError:
+                print(f"[AVISO] {descricao} não localizado pelos seletores disponíveis.")
+                return None
+            except Exception:
+                combinado = None
+
+        if combinado is not None:
+            for seletor in seletores:
+                try:
+                    locator = page.locator(seletor).first
+                    disponivel = locator.is_visible() if somente_visivel else locator.count() > 0
+                except Exception:
+                    continue
+                if disponivel:
+                    print(f"{descricao} localizado pelo seletor: {seletor}")
+                    return locator
+            print(f"{descricao} localizado (seletor combinado).")
+            return combinado.first
+        # --- FIM INSERÇÃO ESPERA SIMULTÂNEA DOS SELETORES ---
+
+        # Contingência: espera sequencial original (ex.: seletor inválido no combinado).
         for seletor in seletores:
             try:
                 locator = page.locator(seletor).first
                 locator.wait_for(
-                    state="visible" if somente_visivel else "attached",
+                    state=estado,
                     timeout=timeout_por_selector,
                 )
                 print(f"{descricao} localizado pelo seletor: {seletor}")
@@ -3329,33 +3501,41 @@ class HapvidaNDIAnaliticosAutomation:
         self.page.keyboard.press("Enter")
 
         self.aguardar_selector(
-            "xpath=//*[contains(., 'Extrato') or contains(., 'Financeiro') or contains(., 'Contrato')]",
-            descricao="tela do contrato",
+            self.SELETOR_TELA_CONTRATO,
+            descricao="tela do contrato (botão Extrato Financeiro)",
             timeout=self.TIMEOUT_LONGO,
         )
         self.respirar_sistema(timeout=20_000, segundos_fallback=2)
 
     def acessar_extrato_financeiro(self):
         print("Acessando a aba de Extrato Financeiro...")
-        btn_extrato = self.localizar_primeiro(
-            "aba/botão Extrato Financeiro",
-            [
-                "xpath=/html/body/div/div/div/main/div/div/main/div/div[3]/div/button[3]",
-                "xpath=//*[self::button or @role='button'][contains(normalize-space(.), 'Extrato Financeiro')]",
-                "xpath=//*[self::button or @role='button'][contains(normalize-space(.), 'Extrato')]",
-            ],
-            timeout_por_selector=20_000,
-        )
+        # --- INÍCIO INSERÇÃO CRONOMETRAGEM DO EXTRATO EM SUB-ETAPAS ---
+        # Separa "achar o botão" de "esperar a tela do extrato" no CSV de tempos,
+        # para saber onde está o tempo gasto nesta etapa.
+        with self.medir_etapa("EXTRATO_LOCALIZAR_BOTAO"):
+            # Seletores por texto primeiro; o XPath absoluto fica por último,
+            # pois quebra com qualquer mudança de layout do portal.
+            btn_extrato = self.localizar_primeiro(
+                "aba/botão Extrato Financeiro",
+                [
+                    "xpath=//*[self::button or @role='button'][contains(normalize-space(.), 'Extrato Financeiro')]",
+                    "xpath=//*[self::button or @role='button'][contains(normalize-space(.), 'Extrato')]",
+                    "xpath=/html/body/div/div/div/main/div/div/main/div/div[3]/div/button[3]",
+                ],
+                timeout_por_selector=20_000,
+            )
         if not btn_extrato:
             raise RuntimeError("Botão/aba de Extrato Financeiro não localizado.")
 
-        self.clicar_e_aguardar(
-            btn_extrato,
-            "Extrato Financeiro",
-            proximo_selector="xpath=//*[contains(., 'Em Aberto') or contains(., 'Histórico') or contains(., 'Historico') or contains(., 'Vencimento') or contains(., 'solicitações') or contains(., 'Solicitações')]",
-            usar_networkidle=True,
-            timeout=self.TIMEOUT_LONGO,
-        )
+        with self.medir_etapa("EXTRATO_CLICAR_E_AGUARDAR_TELA"):
+            self.clicar_e_aguardar(
+                btn_extrato,
+                "Extrato Financeiro",
+                proximo_selector=self.SELETOR_TELA_EXTRATO,
+                usar_networkidle=True,
+                timeout=self.TIMEOUT_LONGO,
+            )
+        # --- FIM INSERÇÃO CRONOMETRAGEM DO EXTRATO EM SUB-ETAPAS ---
 
     def voltar_para_extrato(self):
         print("\nVoltando para o Extrato Financeiro...")
@@ -3365,7 +3545,7 @@ class HapvidaNDIAnaliticosAutomation:
             pass
         self.respirar_sistema(timeout=20_000, segundos_fallback=2)
         self.aguardar_selector(
-            "xpath=//*[contains(., 'Em Aberto') or contains(., 'Histórico') or contains(., 'Historico') or contains(., 'Vencimento') or contains(., 'solicitações') or contains(., 'Solicitações')]",
+            self.SELETOR_TELA_EXTRATO,
             descricao="tabela do extrato financeiro",
             timeout=self.TIMEOUT_LONGO,
         )
@@ -3563,7 +3743,7 @@ class HapvidaNDIAnaliticosAutomation:
             resumo,
         )
         try:
-            with open(self.erros_log_file, "a", encoding="utf-8") as f:
+            with TRAVA_ARQUIVOS, open(self.erros_log_file, "a", encoding="utf-8") as f:
                 for item in self.linhas_extrato_vistas[:200]:
                     f.write(
                         f"    LINHA DO EXTRATO [{item['tab']} pág. {item['pagina']}]: "
@@ -3868,7 +4048,7 @@ class HapvidaNDIAnaliticosAutomation:
             except Exception:
                 pass
             self.aguardar_selector(
-                "xpath=//*[contains(., 'Em Aberto') or contains(., 'Histórico') or contains(., 'Historico') or contains(., 'Vencimento')]",
+                self.SELETOR_TELA_EXTRATO,
                 descricao="Extrato Financeiro para retentativa do boleto",
                 timeout=self.TIMEOUT_LONGO,
             )
@@ -4762,7 +4942,7 @@ class HapvidaNDIAnaliticosAutomation:
             resumo = "A tela desta fatura não tem seção Relatórios nem botões de relatório analítico."
 
         try:
-            with open(self.arquivo_tela_sem_botao, "a", encoding="utf-8") as f:
+            with TRAVA_ARQUIVOS, open(self.arquivo_tela_sem_botao, "a", encoding="utf-8") as f:
                 f.write("=" * 100 + "\n")
                 f.write(
                     f"{datetime.now().strftime('%d/%m/%Y %H:%M:%S')} | CONTRATO: {self.contrato_atual} | "
@@ -4812,10 +4992,7 @@ class HapvidaNDIAnaliticosAutomation:
             raise RuntimeError("Ocorrência da fatura atual não está disponível para reabertura.")
 
         self.fechar_paginas_auxiliares_download()
-        seletor_extrato = (
-            "xpath=//*[contains(., 'Em Aberto') or contains(., 'Histórico') "
-            "or contains(., 'Historico') or contains(., 'Vencimento')]"
-        )
+        seletor_extrato = self.SELETOR_TELA_EXTRATO
 
         if self.tela_detalhes_fatura_aberta():
             try:
@@ -4916,60 +5093,144 @@ class HapvidaNDIAnaliticosAutomation:
         if self.intervalo_tab_analitico:
             time.sleep(self.intervalo_tab_analitico)
 
-        print(f"TAB {quantidade_tabs}x para o relatório {fmt}...")
-        for _ in range(quantidade_tabs):
+        # --- INÍCIO INSERÇÃO TAB ADAPTATIVO NA COPARTICIPAÇÃO ---
+        # Antes: TAB fixo (CSV 1x, TXT 2x, PDF 3x) e, se o foco não estivesse no
+        # botão certo, desistia e ia para o clique. Na execução de 06/10/2026 o
+        # CSV caiu no clique em todos os contratos. Agora o robô avança um TAB por
+        # vez (até TAB esperado + 3) e para no botão "Baixar relatório" correto,
+        # identificado pelo formato da linha ou pela posição do botão abaixo do
+        # título "Relatórios" (1º = CSV, 2º = TXT, 3º = PDF). Se nenhum TAB chegar
+        # lá, foca o botão certo diretamente e o acionamento continua sendo ENTER.
+        ordem_esperada = quantidade_tabs - 1
+        maximo_tabs = quantidade_tabs + 3
+        script_foco = """
+            (titulo) => {
+                const el = document.activeElement;
+                if (!el || el === document.body) return null;
+                const limpar = (t) => (t || '').replace(/\\s+/g, ' ').trim();
+                const seletor = 'button, a, [role="button"]';
+                let bloco = el;
+                let pai = el.parentElement;
+                while (pai && pai.querySelectorAll(seletor).length <= 1) {
+                    bloco = pai;
+                    pai = pai.parentElement;
+                }
+                const visivel = (b) => {
+                    const r = b.getBoundingClientRect();
+                    const s = window.getComputedStyle(b);
+                    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+                };
+                // Botões "Baixar relatório" que vêm depois do título "Relatórios".
+                const botoes = Array.from(document.querySelectorAll(seletor)).filter((b) =>
+                    /baixar relat/i.test(limpar(b.innerText || b.textContent)) && visivel(b) &&
+                    (titulo.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING)
+                );
+                return {
+                    tag: (el.tagName || '').toLowerCase(),
+                    role: el.getAttribute('role') || '',
+                    texto: limpar(el.innerText || el.textContent).slice(0, 80),
+                    linha: limpar(bloco.innerText || bloco.textContent).slice(0, 120),
+                    desabilitado: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+                    ordem: botoes.indexOf(el),
+                    total_botoes: botoes.length
+                };
+            }
+        """
+
+        def avaliar_foco(foco):
+            """Retorna ('OK' | 'CONTINUAR' | 'PAROU', descrição)."""
+            if not foco:
+                return "CONTINUAR", "nenhum elemento em foco"
+            descricao = (
+                f"<{foco.get('tag')}> '{foco.get('texto')}' | linha: '{foco.get('linha')}' | "
+                f"posição: {foco.get('ordem')}/{foco.get('total_botoes')}"
+            )
+            texto_foco = str(foco.get("texto", "")).upper()
+            linha_foco = str(foco.get("linha", "")).upper()
+            clicavel = foco.get("tag") in {"button", "a"} or foco.get("role") == "button"
+            if not clicavel or "BAIXAR RELAT" not in texto_foco:
+                return "CONTINUAR", descricao
+            if foco.get("desabilitado"):
+                return "PAROU", f"O botão em foco está desabilitado: {descricao}"
+
+            formato_linha = ""
+            for candidato in self.FORMATOS_ANALITICOS_SUPORTADOS:
+                if re.match(rf"^{candidato}(\W|$)", linha_foco):
+                    formato_linha = candidato
+                    break
+            if formato_linha == fmt:
+                return "OK", descricao
+            if formato_linha:
+                ordem_linha = self.TABS_RELATORIO_COPARTICIPACAO.get(formato_linha, 0) - 1
+                if ordem_linha > ordem_esperada:
+                    return "PAROU", f"O foco passou do relatório {fmt} (está no {formato_linha}): {descricao}"
+                return "CONTINUAR", descricao
+
+            ordem = foco.get("ordem", -1)
+            if ordem == ordem_esperada:
+                return "OK", descricao
+            if isinstance(ordem, int) and ordem > ordem_esperada:
+                return "PAROU", f"O foco passou do relatório {fmt}: {descricao}"
+            return "CONTINUAR", descricao
+
+        print(f"TAB até o relatório {fmt} (esperado {quantidade_tabs}x, máximo {maximo_tabs}x)...")
+        ultima_descricao = ""
+        for numero_tab in range(1, maximo_tabs + 1):
             page.keyboard.press("Tab")
             if self.intervalo_tab_analitico:
                 time.sleep(self.intervalo_tab_analitico)
+            try:
+                foco = titulo.evaluate(script_foco)
+            except Exception as e:
+                return False, f"Não foi possível ler o elemento em foco: {self.resumir_erro(e)}"
 
+            situacao, ultima_descricao = avaliar_foco(foco)
+            print(f"Foco após TAB {numero_tab}x: {ultima_descricao}")
+            if situacao == "OK":
+                if numero_tab != quantidade_tabs:
+                    print(
+                        f"[INFO] Relatório {fmt} alcançado com TAB {numero_tab}x "
+                        f"(esperado {quantidade_tabs}x)."
+                    )
+                return True, f"TAB {numero_tab}x | {ultima_descricao}"
+            if situacao == "PAROU":
+                break
+
+        # Último recurso do método por teclado: foca diretamente o botão na
+        # posição esperada abaixo de "Relatórios" e confere antes do ENTER.
         try:
-            foco = page.evaluate(
+            focado = titulo.evaluate(
                 """
-                () => {
-                    const el = document.activeElement;
-                    if (!el || el === document.body) return null;
+                (titulo, ordem) => {
                     const limpar = (t) => (t || '').replace(/\\s+/g, ' ').trim();
-                    const seletor = 'button, a, [role="button"]';
-                    let bloco = el;
-                    let pai = el.parentElement;
-                    while (pai && pai.querySelectorAll(seletor).length <= 1) {
-                        bloco = pai;
-                        pai = pai.parentElement;
-                    }
-                    return {
-                        tag: (el.tagName || '').toLowerCase(),
-                        role: el.getAttribute('role') || '',
-                        texto: limpar(el.innerText || el.textContent).slice(0, 80),
-                        linha: limpar(bloco.innerText || bloco.textContent).slice(0, 120),
-                        desabilitado: !!el.disabled || el.getAttribute('aria-disabled') === 'true'
+                    const visivel = (b) => {
+                        const r = b.getBoundingClientRect();
+                        const s = window.getComputedStyle(b);
+                        return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
                     };
+                    const botoes = Array.from(document.querySelectorAll('button, a, [role="button"]')).filter((b) =>
+                        /baixar relat/i.test(limpar(b.innerText || b.textContent)) && visivel(b) &&
+                        (titulo.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING)
+                    );
+                    const alvo = botoes[ordem];
+                    if (!alvo) return false;
+                    alvo.scrollIntoView({block: 'center'});
+                    alvo.focus();
+                    return document.activeElement === alvo;
                 }
-                """
+                """,
+                ordem_esperada,
             )
+            if focado:
+                situacao, descricao_direta = avaliar_foco(titulo.evaluate(script_foco))
+                print(f"Foco direto no botão {ordem_esperada + 1} de Relatórios: {descricao_direta}")
+                if situacao == "OK":
+                    return True, f"foco direto | {descricao_direta}"
         except Exception as e:
-            return False, f"Não foi possível ler o elemento em foco: {self.resumir_erro(e)}"
+            print(f"[AVISO] Foco direto no botão do relatório {fmt} falhou: {self.resumir_erro(e)}")
 
-        if not foco:
-            return False, "Nenhum elemento ficou em foco depois do TAB."
-
-        descricao_foco = f"<{foco.get('tag')}> '{foco.get('texto')}' | linha: '{foco.get('linha')}'"
-        print(f"Foco após TAB {quantidade_tabs}x: {descricao_foco}")
-
-        texto_foco = str(foco.get("texto", "")).upper()
-        linha_foco = str(foco.get("linha", "")).upper()
-        clicavel = foco.get("tag") in {"button", "a"} or foco.get("role") == "button"
-
-        if not clicavel:
-            return False, f"O foco não está em um botão: {descricao_foco}"
-        if foco.get("desabilitado"):
-            return False, f"O botão em foco está desabilitado: {descricao_foco}"
-        if "BAIXAR RELAT" not in texto_foco:
-            return False, f"O foco não está em um botão Baixar relatório: {descricao_foco}"
-        for outro_formato in self.FORMATOS_ANALITICOS_SUPORTADOS:
-            if outro_formato != fmt and re.match(rf"^{outro_formato}(\W|$)", linha_foco):
-                return False, f"O foco está no relatório {outro_formato}, não no {fmt}: {descricao_foco}"
-
-        return True, descricao_foco
+        return False, f"Botão do relatório {fmt} não alcançado pelo teclado. Último foco: {ultima_descricao}"
+        # --- FIM INSERÇÃO TAB ADAPTATIVO NA COPARTICIPAÇÃO ---
 
     def obter_seletores_analitico(self, formato):
         """
@@ -5960,39 +6221,79 @@ class HapvidaNDIAnaliticosAutomation:
         print(f"Contrato mais lento     : {mais_lento[0]} | {mais_lento[1]:.2f} segundos")
         print("=" * 90)
 
+    # --- INÍCIO INSERÇÃO EXECUÇÃO PARALELA (PLANILHA E FILA) ---
+    def preparar_planilha_contratos(self):
+        """Lê e normaliza a planilha (mesmas regras de antes, agora reutilizáveis)."""
+        print(f"Lendo base de dados Excel: {self.file_path}")
+        df_contratos = pd.read_excel(self.file_path)
+        self.validar_colunas_excel(df_contratos)
+
+        df_contratos.dropna(subset=["CONTRATO", "VENCIMENTO"], inplace=True)
+        df_contratos["VENCIMENTO"] = pd.to_datetime(
+            df_contratos["VENCIMENTO"],
+            dayfirst=True,
+            errors="coerce",
+        ).dt.strftime("%d/%m/%Y")
+        df_contratos.dropna(subset=["VENCIMENTO"], inplace=True)
+
+        if "STATUS" not in df_contratos.columns:
+            df_contratos["STATUS"] = ""
+        if "DETALHES_DOWNLOAD" not in df_contratos.columns:
+            df_contratos["DETALHES_DOWNLOAD"] = ""
+        if "ULTIMA_EXECUCAO" not in df_contratos.columns:
+            df_contratos["ULTIMA_EXECUCAO"] = ""
+        return df_contratos
+
+    def iterar_linhas_contratos(self, df_contratos):
+        """
+        Sequencial: percorre a planilha na ordem.
+        Paralelo: retira a próxima linha da fila comum a todas as janelas.
+        """
+        if self.fila_linhas is None:
+            yield from df_contratos.iterrows()
+            return
+        while True:
+            if self.evento_parada is not None and self.evento_parada.is_set():
+                return
+            try:
+                index = self.fila_linhas.get_nowait()
+            except queue.Empty:
+                return
+            self.indices_processados.append(index)
+            yield index, df_contratos.loc[index]
+
+    def contar_contrato_finalizado(self):
+        """Quantidade de contratos finalizados, somando todas as janelas."""
+        self.contratos_finalizados += 1
+        progresso = self.progresso_paralelo
+        if not progresso:
+            return self.contratos_finalizados
+        with progresso["trava"]:
+            progresso["concluidos"] += 1
+            return progresso["concluidos"]
+    # --- FIM INSERÇÃO EXECUÇÃO PARALELA (PLANILHA E FILA) ---
+
     def executar_modo_rapido(self):
         df_contratos = None
         index_atual = None
         contratos_iniciados = 0
         self.tempos_contratos = []
         self.tempos_etapas = []
-        self.inicio_execucao_geral = time.perf_counter()
+        if not self.modo_worker:
+            self.inicio_execucao_geral = time.perf_counter()
 
         try:
-            print(f"Lendo base de dados Excel: {self.file_path}")
-            with self.medir_etapa("LEITURA_E_PREPARACAO_EXCEL"):
-                df_contratos = pd.read_excel(self.file_path)
-            self.validar_colunas_excel(df_contratos)
-
-            df_contratos.dropna(subset=["CONTRATO", "VENCIMENTO"], inplace=True)
-            df_contratos["VENCIMENTO"] = pd.to_datetime(
-                df_contratos["VENCIMENTO"],
-                dayfirst=True,
-                errors="coerce",
-            ).dt.strftime("%d/%m/%Y")
-            df_contratos.dropna(subset=["VENCIMENTO"], inplace=True)
-            self.total_contratos_planejados = len(df_contratos)
-
-            if "STATUS" not in df_contratos.columns:
-                df_contratos["STATUS"] = ""
-            if "DETALHES_DOWNLOAD" not in df_contratos.columns:
-                df_contratos["DETALHES_DOWNLOAD"] = ""
-            if "ULTIMA_EXECUCAO" not in df_contratos.columns:
-                df_contratos["ULTIMA_EXECUCAO"] = ""
+            if self.df_contratos_preparado is not None:
+                # Janela paralela: a planilha já foi lida pelo coordenador.
+                df_contratos = self.df_contratos_preparado
+            else:
+                with self.medir_etapa("LEITURA_E_PREPARACAO_EXCEL"):
+                    df_contratos = self.preparar_planilha_contratos()
+                self.total_contratos_planejados = len(df_contratos)
 
             print("Modo rápido ATIVADO: o navegador e o login serão reutilizados entre os contratos.")
 
-            for index, row in df_contratos.iterrows():
+            for index, row in self.iterar_linhas_contratos(df_contratos):
                 inicio_contrato = time.perf_counter()
                 index_atual = index
                 modulo = row["MÓDULO"]
@@ -6011,6 +6312,20 @@ class HapvidaNDIAnaliticosAutomation:
                 self.index_linha_atual = index
                 self.evidencias_contrato_atual = []
                 self.pasta_contrato_atual = self.obter_pasta_contrato(contrato, vencimento)
+
+                # --- INÍCIO INSERÇÃO PULAR CONTRATO JÁ CONCLUÍDO ---
+                if self.contrato_ja_concluido(contrato, vencimento):
+                    print(
+                        f"Linha {index + 1} | Contrato {contrato} | Venc {vencimento}: "
+                        "já concluído em execução anterior. Pulando sem abrir o portal."
+                    )
+                    self.resumo_execucao["contratos_pulados_concluidos"] += 1
+                    df_contratos.at[index, "STATUS"] = "Já concluído anteriormente"
+                    df_contratos.at[index, "ULTIMA_EXECUCAO"] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                    self.contar_contrato_finalizado()
+                    continue
+                # --- FIM INSERÇÃO PULAR CONTRATO JÁ CONCLUÍDO ---
+
                 self.resumo_execucao["contratos_processados"] += 1
 
                 print("\n=======================================================")
@@ -6062,6 +6377,9 @@ class HapvidaNDIAnaliticosAutomation:
                     if resultado_contrato == "COMPLETO":
                         status = "Sucesso completo - Todos os documentos concluídos"
                         self.resumo_execucao["contratos_sucesso"] += 1
+                        # --- INÍCIO INSERÇÃO PULAR CONTRATO JÁ CONCLUÍDO ---
+                        self.registrar_contrato_concluido(contrato, vencimento)
+                        # --- FIM INSERÇÃO PULAR CONTRATO JÁ CONCLUÍDO ---
                     elif resultado_contrato == "PARCIAL":
                         status = "Pendência - Download parcial"
                         self.resumo_execucao["contratos_pendencia"] += 1
@@ -6097,7 +6415,7 @@ class HapvidaNDIAnaliticosAutomation:
                     self.tempos_contratos.append((str(contrato), tempo_contrato))
                     self.registrar_tempo_etapa("TOTAL_CONTRATO", tempo_contrato)
                     print(f"Tempo do contrato {contrato}: {self.formatar_duracao(tempo_contrato)} ({tempo_contrato:.2f} segundos)")
-                    self.imprimir_projecao_execucao(len(self.tempos_contratos))
+                    self.imprimir_projecao_execucao(self.contar_contrato_finalizado())
 
                     try:
                         status_evidencia = df_contratos.at[index, "STATUS"] if "STATUS" in df_contratos.columns else ""
@@ -6129,6 +6447,15 @@ class HapvidaNDIAnaliticosAutomation:
                     pass
 
         finally:
+            # --- INÍCIO INSERÇÃO EXECUÇÃO PARALELA (FIM DA JANELA) ---
+            # Janela paralela: só fecha o navegador; os resumos são consolidados
+            # pelo coordenador depois que todas as janelas terminam.
+            if self.modo_worker:
+                self.fechar_navegador()
+                print("Janela finalizada: não há mais contratos na fila.")
+                return
+            # --- FIM INSERÇÃO EXECUÇÃO PARALELA (FIM DA JANELA) ---
+
             if self.atualizar_excel_original:
                 print("\nSalvando status no arquivo Excel...")
                 try:
@@ -6151,9 +6478,132 @@ class HapvidaNDIAnaliticosAutomation:
             self.fechar_navegador()
     # --- FIM INSERÇÃO MODO RÁPIDO COM SESSÃO REUTILIZÁVEL ---
 
+    # --- INÍCIO INSERÇÃO EXECUÇÃO PARALELA (COORDENADOR) ---
+    def executar_paralelo(self):
+        """
+        Abre N janelas independentes (navegador e login próprios, uma thread
+        cada) que retiram contratos de uma fila comum. Esta instância apenas
+        coordena: lê a planilha, distribui as linhas e consolida os resumos.
+        """
+        self.tempos_contratos = []
+        self.tempos_etapas = []
+        self.inicio_execucao_geral = time.perf_counter()
+
+        with self.medir_etapa("LEITURA_E_PREPARACAO_EXCEL"):
+            df_contratos = self.preparar_planilha_contratos()
+        self.total_contratos_planejados = len(df_contratos)
+
+        quantidade = max(1, min(self.quantidade_workers, len(df_contratos)))
+        print(
+            f"Execução paralela: {quantidade} janela(s) para {len(df_contratos)} contrato(s). "
+            f"Intervalo entre aberturas: {self.intervalo_inicio_workers:.1f}s."
+        )
+
+        # Credenciais resolvidas uma única vez aqui; as janelas não perguntam no terminal.
+        email, senha = self.obter_credenciais()
+        os.environ["HAPVIDA_EMAIL"] = email
+        os.environ["HAPVIDA_SENHA"] = senha
+
+        fila = queue.Queue()
+        for index in df_contratos.index:
+            fila.put(index)
+        progresso = {"concluidos": 0, "trava": threading.Lock()}
+        evento_parada = threading.Event()
+        workers = []
+        trava_workers = threading.Lock()
+
+        def rodar_worker(numero):
+            _contexto_thread.prefixo = f"[W{numero}]"
+            try:
+                worker = HapvidaNDIAnaliticosAutomation(self.file_path)
+                worker.modo_worker = True
+                worker.numero_worker = numero
+                worker.fila_linhas = fila
+                worker.df_contratos_preparado = df_contratos.copy()
+                worker.progresso_paralelo = progresso
+                worker.evento_parada = evento_parada
+                worker.inicio_execucao_geral = self.inicio_execucao_geral
+                worker.total_contratos_planejados = self.total_contratos_planejados
+                # Cada janela tem só uma parte das linhas: o Excel é salvo pelo coordenador.
+                worker.atualizar_excel_original = False
+                with trava_workers:
+                    workers.append(worker)
+                worker.executar_modo_rapido()
+            except Exception as e:
+                print(f"[ERRO] Janela {numero} encerrada por falha: {self.resumir_erro(e)}")
+                self.registrar_erro(f"Falha na janela paralela {numero}", self.resumir_erro(e))
+
+        threads = []
+        try:
+            for numero in range(1, quantidade + 1):
+                if fila.empty():
+                    break
+                thread = threading.Thread(
+                    target=rodar_worker,
+                    args=(numero,),
+                    name=f"Worker-{numero}",
+                    daemon=True,
+                )
+                thread.start()
+                threads.append(thread)
+                # Escalona as aberturas para não fazer todos os logins no mesmo instante.
+                if numero < quantidade and self.intervalo_inicio_workers:
+                    limite = time.monotonic() + self.intervalo_inicio_workers
+                    while time.monotonic() < limite and not fila.empty():
+                        time.sleep(0.2)
+
+            while any(thread.is_alive() for thread in threads):
+                for thread in threads:
+                    thread.join(timeout=1.0)
+        except KeyboardInterrupt:
+            print("\n[AVISO] Interrupção solicitada: as janelas terminam o contrato atual e param.")
+            evento_parada.set()
+            for thread in threads:
+                thread.join(timeout=120)
+
+        # --- Consolidação dos resultados de todas as janelas ---
+        for worker in workers:
+            for chave, valor in worker.resumo_execucao.items():
+                if isinstance(valor, (int, float)):
+                    self.resumo_execucao[chave] = self.resumo_execucao.get(chave, 0) + valor
+            self.tempos_etapas.extend(worker.tempos_etapas)
+            self.tempos_contratos.extend(worker.tempos_contratos)
+            self.diagnosticos_execucao.extend(worker.diagnosticos_execucao)
+            for codigo, quantidade_codigo in worker.contagem_codigos_falha.items():
+                self.contagem_codigos_falha[codigo] = self.contagem_codigos_falha.get(codigo, 0) + quantidade_codigo
+            for index in worker.indices_processados:
+                for coluna in ("STATUS", "DETALHES_DOWNLOAD", "ULTIMA_EXECUCAO"):
+                    try:
+                        df_contratos.at[index, coluna] = worker.df_contratos_preparado.at[index, coluna]
+                    except Exception:
+                        pass
+
+        if self.atualizar_excel_original:
+            print("\nSalvando status no arquivo Excel...")
+            try:
+                df_contratos.to_excel(self.file_path, index=False)
+                print("Arquivo Excel atualizado com sucesso!")
+            except Exception as e:
+                print(f"[ERRO] Não foi possível salvar o Excel. Feche a planilha se estiver aberta. Erro: {e}")
+        else:
+            print("\nArquivo Excel original mantido sem alteração. Controle da execução foi gravado em TXT.")
+
+        self.imprimir_resumo_final()
+        self.imprimir_resumo_desempenho()
+        tempo_total_execucao = time.perf_counter() - self.inicio_execucao_geral
+        self.registrar_tempo_etapa("TOTAL_EXECUCAO", tempo_total_execucao)
+        print(f"Tempo total real da execução: {self.formatar_duracao(tempo_total_execucao)}")
+        self.gerar_resumo_tempos()
+        self.gerar_resumo_diagnosticos()
+    # --- FIM INSERÇÃO EXECUÇÃO PARALELA (COORDENADOR) ---
+
     def executar(self):
         # --- INÍCIO INSERÇÃO ATIVAÇÃO DO MODO RÁPIDO ---
         if self.modo_rapido:
+            # --- INÍCIO INSERÇÃO EXECUÇÃO PARALELA (ATIVAÇÃO) ---
+            if self.quantidade_workers > 1:
+                return self.executar_paralelo()
+            # --- FIM INSERÇÃO EXECUÇÃO PARALELA (ATIVAÇÃO) ---
             return self.executar_modo_rapido()
         # --- FIM INSERÇÃO ATIVAÇÃO DO MODO RÁPIDO ---
 
