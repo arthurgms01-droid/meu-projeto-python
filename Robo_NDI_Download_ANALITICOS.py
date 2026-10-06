@@ -35,6 +35,16 @@ Novidades desta versão:
 - Validação do conteúdo: CRC do ZIP, assinatura do PDF e texto plausível.
 - Extração automática dos .zip (EXTRAIR_ZIP_ANALITICO=0 desativa).
 
+Organização dos arquivos:
+- Pasta única por tipo, sem subpastas por mês ou contrato:
+      Downloads/MENSALIDADE/
+      Downloads/COPARTICIPACAO/
+- Os arquivos mantêm o nome original entregue pelo portal
+  (ex.: EMPRESA_FM_0T9W1_REMESSA_6365924.csv). O nome padrão do robô só é
+  usado quando o portal não informa nome (captura por Blob).
+- Coparticipação: o .zip é extraído e removido; ficam só os arquivos.
+- Evidências por contrato: Logs/Evidencias/.
+
 Instalação:
     py -m pip install pandas openpyxl playwright
     py -m playwright install chromium
@@ -50,7 +60,7 @@ Credenciais:
 Configurações opcionais (.env ou variáveis de ambiente):
     FORMATOS_ANALITICOS=CSV,TXT,PDF      formatos a baixar
     BAIXAR_BOLETO_NF=0                   1 = baixa também Boleto e Nota Fiscal
-    EXTRAIR_ZIP_ANALITICO=1              0 = mantém apenas o .zip
+    EXTRAIR_ZIP_ANALITICO=1              extrai e remove o .zip; 0 = mantém apenas o .zip
     TIMEOUT_DOWNLOAD_ANALITICO_MS=60000  espera máxima por arquivo
 """
 
@@ -67,7 +77,7 @@ import zipfile
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import pandas as pd
 # --- INÍCIO INSERÇÃO PLAYWRIGHT (IMPORTS) ---
@@ -253,9 +263,12 @@ class HapvidaNDIAnaliticosAutomation:
         self.downloads_dir = self.base_dir / "Downloads"
         self.logs_dir = self.base_dir / "Logs"
         self.screenshots_dir = self.logs_dir / "Screenshots"
+        # Evidências por contrato ficam nos Logs, fora das pastas de download.
+        self.evidencias_dir = self.logs_dir / "Evidencias"
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.screenshots_dir.mkdir(parents=True, exist_ok=True)
+        self.evidencias_dir.mkdir(parents=True, exist_ok=True)
 
         self.log_file = self.logs_dir / "downloads_concluidos.log"
         self.erros_log_file = self.logs_dir / "erros_execucao.log"
@@ -702,20 +715,15 @@ class HapvidaNDIAnaliticosAutomation:
                 return "COMPETENCIA_NAO_IDENTIFICADA"
 
     def obter_pasta_contrato(self, contrato=None, vencimento=None):
-        contrato = contrato if contrato is not None else self.contrato_atual
-        vencimento = vencimento if vencimento is not None else self.vencimento_atual
-        competencia = self.obter_competencia_por_vencimento(vencimento)
-        contrato_limpo = self.limpar_nome_arquivo(str(contrato or "SEM_CONTRATO"))
-        pasta = self.downloads_dir / competencia / contrato_limpo
-        pasta.mkdir(parents=True, exist_ok=True)
-        return pasta
+        # Pasta única: não há mais subpastas por competência nem por contrato.
+        # As evidências por contrato são gravadas em Logs/Evidencias.
+        self.evidencias_dir.mkdir(parents=True, exist_ok=True)
+        return self.evidencias_dir
 
     def definir_pasta_download_atual(self, contrato, vencimento, tipo_fatura):
-        competencia = self.obter_competencia_por_vencimento(vencimento)
-        contrato_limpo = self.limpar_nome_arquivo(str(contrato or "SEM_CONTRATO"))
+        # Pasta única por tipo: Downloads/MENSALIDADE ou Downloads/COPARTICIPACAO.
         tipo_limpo = self.limpar_nome_arquivo(self.obter_sufixo_tipo_fatura(tipo_fatura))
-        self.pasta_contrato_atual = self.downloads_dir / competencia / contrato_limpo
-        self.pasta_download_atual = self.pasta_contrato_atual / tipo_limpo
+        self.pasta_download_atual = self.downloads_dir / tipo_limpo
         self.pasta_download_atual.mkdir(parents=True, exist_ok=True)
         return self.pasta_download_atual
 
@@ -901,7 +909,7 @@ class HapvidaNDIAnaliticosAutomation:
             linhas.append(f"Status do contrato: {status_contrato}")
             linhas.append(f"Detalhes: {detalhes_contrato}")
             linhas.append(f"Data/hora: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
-            linhas.append(f"Pasta do contrato: {pasta_contrato}")
+            linhas.append(f"Pasta da evidência: {pasta_contrato}")
             linhas.append("")
 
             if not self.evidencias_contrato_atual:
@@ -1609,6 +1617,71 @@ class HapvidaNDIAnaliticosAutomation:
         nome = nome.replace("__", "_")
         return nome.strip("._ ") or "arquivo"
 
+    # --- INÍCIO INSERÇÃO NOME ORIGINAL DO ARQUIVO ---
+    def limpar_nome_original(self, nome):
+        """
+        Mantém o nome entregue pelo portal. Remove apenas o caminho e os
+        caracteres que o Windows não aceita em nomes de arquivo.
+        Retorna "" quando não há nome aproveitável.
+        """
+        nome = str(nome or "").replace("\\", "/").split("/")[-1].strip()
+        nome = re.sub(r"[:*?\"<>|\x00-\x1f]+", "_", nome)
+        nome = nome.strip(". ")
+        if not Path(nome).stem:
+            return ""
+        return nome
+
+    def obter_nome_original_resposta(self, url="", headers=None):
+        """
+        Nome original de um arquivo obtido por URL: primeiro o cabeçalho
+        Content-Disposition da resposta; depois o nome no fim da URL.
+        """
+        headers = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+        disposicao = headers.get("content-disposition", "")
+        if disposicao:
+            # filename*=UTF-8''nome%20codificado.csv
+            m = re.search(r"filename\*\s*=\s*(?:[\w-]+)?'[^']*'([^;]+)", disposicao, re.IGNORECASE)
+            if m:
+                nome = self.limpar_nome_original(unquote(m.group(1).strip().strip('"')))
+                if nome:
+                    return nome
+            m = re.search(r"filename\s*=\s*\"?([^\";]+)\"?", disposicao, re.IGNORECASE)
+            if m:
+                nome = self.limpar_nome_original(unquote(m.group(1).strip()))
+                if nome:
+                    return nome
+
+        try:
+            caminho_url = unquote(urlparse(str(url or "")).path)
+        except Exception:
+            caminho_url = ""
+        nome = self.limpar_nome_original(caminho_url)
+        # Só aceita o fim da URL quando é realmente um arquivo (evita .aspx, .ashx etc.).
+        if nome and Path(nome).suffix.lower() in {".csv", ".txt", ".pdf", ".zip"}:
+            return nome
+        return ""
+
+    def montar_caminho_destino(self, pasta_destino, nome_original, novo_nome_base, ext):
+        """
+        Usa o nome original quando existir; o nome padrão do robô fica apenas
+        como contingência (ex.: PDF capturado por Blob, que não tem nome).
+        O contador _1, _2... só é usado para nunca sobrescrever um arquivo.
+        """
+        nome_original = self.limpar_nome_original(nome_original)
+        if nome_original:
+            base = Path(nome_original).stem
+            ext = Path(nome_original).suffix or ext
+        else:
+            base = self.limpar_nome_arquivo(novo_nome_base)
+
+        caminho = pasta_destino / f"{base}{ext}"
+        contador = 1
+        while caminho.exists():
+            caminho = pasta_destino / f"{base}_{contador}{ext}"
+            contador += 1
+        return caminho
+    # --- FIM INSERÇÃO NOME ORIGINAL DO ARQUIVO ---
+
     def formatar_vencimento_nome_arquivo(self, vencimento_alvo):
         try:
             return datetime.strptime(str(vencimento_alvo), "%d/%m/%Y").strftime("%d-%m-%y")
@@ -1633,16 +1706,10 @@ class HapvidaNDIAnaliticosAutomation:
         if not ext:
             ext = ".bin"
 
-        # --- INÍCIO INSERÇÃO PASTA POR COMPETÊNCIA / CONTRATO / TIPO ---
+        # --- INÍCIO INSERÇÃO PASTA ÚNICA POR TIPO / NOME ORIGINAL ---
         pasta_destino = self.obter_pasta_download_atual()
-        # --- FIM INSERÇÃO PASTA POR COMPETÊNCIA / CONTRATO / TIPO ---
-        nome_base_limpo = self.limpar_nome_arquivo(novo_nome_base)
-        caminho = pasta_destino / f"{nome_base_limpo}{ext}"
-
-        contador = 1
-        while caminho.exists():
-            caminho = pasta_destino / f"{nome_base_limpo}_{contador}{ext}"
-            contador += 1
+        caminho = self.montar_caminho_destino(pasta_destino, suggested, novo_nome_base, ext)
+        # --- FIM INSERÇÃO PASTA ÚNICA POR TIPO / NOME ORIGINAL ---
 
         download.save_as(str(caminho))
         print(f"Arquivo salvo: {caminho.name}")
@@ -2211,19 +2278,13 @@ class HapvidaNDIAnaliticosAutomation:
 
 
     # --- INÍCIO INSERÇÃO CORREÇÃO BOLETO/NF (DOWNLOAD ROBUSTO IGUAL AO SELENIUM ORIGINAL) ---
-    def salvar_bytes_em_arquivo(self, conteudo, novo_nome_base, extensao_fallback=".pdf"):
+    def salvar_bytes_em_arquivo(self, conteudo, novo_nome_base, extensao_fallback=".pdf", nome_original=""):
         try:
             ext = extensao_fallback if str(extensao_fallback).startswith(".") else f".{extensao_fallback}"
-            # --- INÍCIO INSERÇÃO PASTA POR COMPETÊNCIA / CONTRATO / TIPO ---
+            # --- INÍCIO INSERÇÃO PASTA ÚNICA POR TIPO / NOME ORIGINAL ---
             pasta_destino = self.obter_pasta_download_atual()
-            # --- FIM INSERÇÃO PASTA POR COMPETÊNCIA / CONTRATO / TIPO ---
-            nome_base_limpo = self.limpar_nome_arquivo(novo_nome_base)
-            caminho = pasta_destino / f"{nome_base_limpo}{ext}"
-
-            contador = 1
-            while caminho.exists():
-                caminho = pasta_destino / f"{nome_base_limpo}_{contador}{ext}"
-                contador += 1
+            caminho = self.montar_caminho_destino(pasta_destino, nome_original, novo_nome_base, ext)
+            # --- FIM INSERÇÃO PASTA ÚNICA POR TIPO / NOME ORIGINAL ---
 
             with open(caminho, "wb") as f:
                 f.write(conteudo)
@@ -2394,7 +2455,13 @@ class HapvidaNDIAnaliticosAutomation:
             if not conteudo:
                 print("[AVISO] Fallback de URL retornou conteúdo vazio.")
                 return None
-            return self.salvar_bytes_em_arquivo(conteudo, novo_nome_base, extensao_fallback)
+            nome_original = self.obter_nome_original_resposta(url, resposta.headers)
+            return self.salvar_bytes_em_arquivo(
+                conteudo,
+                novo_nome_base,
+                extensao_fallback,
+                nome_original=nome_original,
+            )
         except Exception as e:
             print(f"[AVISO] Falha no fallback de URL autenticada: {self.resumir_erro(e)}")
             self.registrar_erro("Falha no fallback de URL autenticada", self.resumir_erro(e))
@@ -3683,8 +3750,10 @@ class HapvidaNDIAnaliticosAutomation:
         """Verifica se o PDF apareceu na pasta mesmo sem o evento Playwright ser capturado."""
         try:
             pasta = self.obter_pasta_download_atual()
+            # Com o nome original do portal, o arquivo não segue o nome padrão do
+            # robô: considera qualquer PDF da pasta gravado após o clique.
             candidatos = sorted(
-                pasta.glob(f"{self.limpar_nome_arquivo(novo_nome_base)}*.pdf"),
+                pasta.glob("*.[pP][dD][fF]"),
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
             )
@@ -5054,11 +5123,13 @@ class HapvidaNDIAnaliticosAutomation:
         2º: fetch executado dentro da própria aba, que é da mesma origem.
         """
         conteudo = None
+        headers_resposta = {}
 
         try:
             resposta = self.context.request.get(url, timeout=self.TIMEOUT_DOWNLOAD)
             if resposta.ok:
                 conteudo = resposta.body()
+                headers_resposta = resposta.headers
             else:
                 print(
                     f"[AVISO] URL do relatório retornou HTTP {resposta.status}: "
@@ -5089,7 +5160,8 @@ class HapvidaNDIAnaliticosAutomation:
             return None
 
         extensao = self.obter_extensao_por_url(url, extensao_fallback)
-        return self.salvar_bytes_em_arquivo(conteudo, novo_nome_base, extensao)
+        nome_original = self.obter_nome_original_resposta(url, headers_resposta)
+        return self.salvar_bytes_em_arquivo(conteudo, novo_nome_base, extensao, nome_original=nome_original)
 
     def capturar_arquivo_analitico_por_clique(self, locator, descricao, novo_nome_base, formato, page=None, acionar=None):
         """
@@ -5185,19 +5257,10 @@ class HapvidaNDIAnaliticosAutomation:
                         urls_arquivo_rede.insert(0, url_download)
                     continue
                 if caminho_download:
-                    # O portal sugere nomes com extensão maiúscula (.ZIP, .CSV); padroniza.
-                    try:
-                        caminho_download = Path(caminho_download)
-                        caminho_minusculo = caminho_download.with_suffix(caminho_download.suffix.lower())
-                        if caminho_minusculo.name != caminho_download.name and (
-                            os.name == "nt" or not caminho_minusculo.exists()
-                        ):
-                            caminho_download.rename(caminho_minusculo)
-                            caminho_download = caminho_minusculo
-                    except Exception:
-                        pass
+                    # O nome sugerido pelo portal é mantido exatamente como veio
+                    # (inclusive a extensão em maiúsculas, ex.: .ZIP, .CSV).
                     return {
-                        "caminho": caminho_download,
+                        "caminho": Path(caminho_download),
                         "metodo": "download",
                         "url": url_download,
                     }
@@ -5466,31 +5529,28 @@ class HapvidaNDIAnaliticosAutomation:
 
     def extrair_zip_analitico(self, caminho_zip, novo_nome_base):
         """
-        Extrai os arquivos do .zip para a mesma pasta, com o nome padrão do robô.
-        O .zip original é mantido. Retorna a lista de caminhos extraídos.
+        Extrai os arquivos do .zip para a mesma pasta, mantendo o nome original
+        de cada arquivo dentro do .zip. Retorna a lista de caminhos extraídos.
+        A remoção do .zip é feita por baixar_relatorio_analitico após o registro.
         """
         extraidos = []
         caminho_zip = Path(caminho_zip)
         pasta_destino = caminho_zip.parent
-        nome_base_limpo = self.limpar_nome_arquivo(novo_nome_base)
 
         with zipfile.ZipFile(caminho_zip) as pacote:
             membros = [item for item in pacote.infolist() if not item.is_dir()]
             for numero, item in enumerate(membros, 1):
                 # Usa apenas o nome final do membro: nunca grava fora da pasta de destino.
                 nome_membro = Path(str(item.filename).replace("\\", "/")).name
-                extensao = Path(nome_membro).suffix.lower() or ".bin"
                 sufixo = "" if len(membros) == 1 else f"_{numero}"
+                nome_padrao = f"{novo_nome_base}{sufixo}"
+                extensao = Path(nome_membro).suffix or ".bin"
 
-                destino = pasta_destino / f"{nome_base_limpo}{sufixo}{extensao}"
-                contador = 1
-                while destino.exists():
-                    destino = pasta_destino / f"{nome_base_limpo}{sufixo}_{contador}{extensao}"
-                    contador += 1
+                destino = self.montar_caminho_destino(pasta_destino, nome_membro, nome_padrao, extensao)
 
                 with pacote.open(item) as origem, open(destino, "wb") as saida:
                     shutil.copyfileobj(origem, saida)
-                print(f"Arquivo extraído do ZIP: {destino.name} (original: {nome_membro})")
+                print(f"Arquivo extraído do ZIP: {destino.name}")
                 extraidos.append(destino)
 
         return extraidos
@@ -5693,10 +5753,26 @@ class HapvidaNDIAnaliticosAutomation:
             extraidos=extraidos,
         )
 
-        caminhos_evidencia = " ; ".join(str(item) for item in [caminho] + extraidos)
+        # --- INÍCIO INSERÇÃO MANTER SOMENTE ARQUIVOS DESCOMPACTADOS ---
+        # O rastreamento acima já gravou bytes/SHA-256 do .zip e os nomes extraídos.
+        # Com a extração concluída, o .zip é removido e ficam só os arquivos.
+        arquivos_finais = [caminho]
+        if extraidos:
+            arquivos_finais = list(extraidos)
+            try:
+                caminho.unlink()
+                print(f"ZIP removido após extração: {caminho.name}")
+            except Exception as e:
+                arquivos_finais = [caminho] + list(extraidos)
+                print(f"[AVISO] Arquivos extraídos, mas o ZIP não pôde ser removido: {self.resumir_erro(e)}")
+                self.registrar_erro(f"Falha ao remover ZIP do {descricao}", self.resumir_erro(e))
+        # --- FIM INSERÇÃO MANTER SOMENTE ARQUIVOS DESCOMPACTADOS ---
+
+        caminhos_evidencia = " ; ".join(str(item) for item in arquivos_finais)
         self.marcar_documento_fatura(documento, "OK", caminho=caminhos_evidencia)
         self.registrar_documento_log(contrato, vencimento_alvo, tipo_fatura, documento)
-        print(f"{descricao} concluído: {caminho.name} | {validacao} | método: {metodo}")
+        nomes_finais = ", ".join(Path(item).name for item in arquivos_finais)
+        print(f"{descricao} concluído: {nomes_finais} | {validacao} | método: {metodo}")
         return True
     # --- FIM INSERÇÃO RELATÓRIOS ANALÍTICOS ---
 
