@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import html
 import logging
 import os
 import queue
@@ -286,7 +287,8 @@ def escolher_coluna(cabecalhos: dict[str, int], aliases: tuple[str, ...], obriga
 def ler_credenciais(planilha: Path, vigencia_escolhida: str) -> list[Credencial]:
     wb = load_workbook(planilha, read_only=True, data_only=True)
     try:
-        ws = next((aba for aba in wb.worksheets if aba.max_row >= 2), wb.active)
+        # Em modo read_only, max_row pode ser None quando a planilha não grava as dimensões.
+        ws = next((aba for aba in wb.worksheets if (aba.max_row or 0) >= 2), wb.active)
         cabecalhos = {
             normalizar(celula.value): indice
             for indice, celula in enumerate(ws[1], start=1)
@@ -305,13 +307,19 @@ def ler_credenciais(planilha: Path, vigencia_escolhida: str) -> list[Credencial]
         col_ativo = escolher_coluna(cabecalhos, ("ativo", "processar", "status"), False)
 
         credenciais: list[Credencial] = []
-        for linha in range(2, ws.max_row + 1):
-            usuario = texto(ws.cell(linha, col_usuario).value)
-            senha = texto(ws.cell(linha, col_senha).value)
-            inscricao = texto(ws.cell(linha, col_inscricao).value)
-            ativo = texto(ws.cell(linha, col_ativo).value) if col_ativo else "SIM"
-            codigo = texto(ws.cell(linha, col_codigo).value) if col_codigo else ""
-            vigencia = padronizar_vigencia(texto(ws.cell(linha, col_vigencia).value)) if col_vigencia else ""
+        # iter_rows lê a aba uma única vez; ws.cell() em modo read_only relê o arquivo a cada célula.
+        for linha, valores in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+            def celula(coluna: int | None) -> str:
+                if not coluna or coluna > len(valores):
+                    return ""
+                return texto(valores[coluna - 1])
+
+            usuario = celula(col_usuario)
+            senha = celula(col_senha)
+            inscricao = celula(col_inscricao)
+            ativo = celula(col_ativo) if col_ativo else "SIM"
+            codigo = celula(col_codigo)
+            vigencia = padronizar_vigencia(celula(col_vigencia)) if col_vigencia else ""
 
             if normalizar(ativo) in {"nao", "n", "0", "inativo", "ignorar"}:
                 continue
@@ -329,7 +337,7 @@ def ler_credenciais(planilha: Path, vigencia_escolhida: str) -> list[Credencial]
                     usuario=usuario,
                     senha=senha,
                     inscricao_municipal=inscricao,
-                    contrato=texto(ws.cell(linha, col_contrato).value) if col_contrato else "",
+                    contrato=celula(col_contrato),
                     codigo=codigo,
                     vigencia=vigencia,
                 )
@@ -458,14 +466,35 @@ def localizar_opcao_segunda_via(page: Page) -> Locator | None:
 def tabela_boletos(page: Page) -> Locator:
     """Localiza a grade pelos cabeçalhos, independentemente das divs do layout."""
     cabecalho_codigo = page.locator("th", has_text=re.compile(r"c[oó]digos?", re.I))
-    return page.locator("main table:has(thead):has(tbody)").filter(has=cabecalho_codigo).first
+    tabela_main = page.locator("main table:has(thead):has(tbody)").filter(has=cabecalho_codigo)
+    if tabela_main.count():
+        return tabela_main.first
+    # Alternativa caso o layout não use <main>.
+    return page.locator("table:has(thead):has(tbody)").filter(has=cabecalho_codigo).first
+
+
+def algum_visivel(locator: Locator, limite: int = 10) -> bool:
+    """True se qualquer ocorrência estiver visível (não somente a primeira, que pode estar oculta)."""
+    try:
+        for indice in range(min(locator.count(), limite)):
+            if locator.nth(indice).is_visible():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def tabela_com_linhas_visivel(page: Page) -> bool:
+    tabela = tabela_boletos(page)
+    try:
+        return bool(tabela.count()) and tabela.is_visible() and tabela.locator("tbody tr td").count() > 0
+    except Exception:
+        return False
 
 
 def aviso_sem_registros(page: Page) -> bool:
-    aviso = page.get_by_text(
-        re.compile(r"Nenhum (?:registro|boleto) localizado", re.I)
-    ).first
-    return aviso.count() > 0 and aviso.is_visible(timeout=500)
+    aviso = page.get_by_text(re.compile(r"Nenhum (?:registro|boleto) localizado", re.I))
+    return algum_visivel(aviso)
 
 
 def navegar_segunda_via(page: Page, logger: logging.Logger) -> None:
@@ -480,20 +509,32 @@ def navegar_segunda_via(page: Page, logger: logging.Logger) -> None:
         )
     opcao.click()
     aguardar_carregamento(page, 1_500)
-    page.locator("main").get_by_text(re.compile(r"Segunda Via de Boletos", re.I)).first.wait_for(
-        state="visible", timeout=TIMEOUT_CARREGAMENTO_MS
-    )
-    limite = time.monotonic() + 15
+
+    # A página contém mais de um elemento com o texto "Segunda Via de Boletos" e o primeiro
+    # pode estar oculto; por isso a tela é confirmada pela própria tabela ou pelo aviso.
+    # O portal pode exibir "Nenhum registro localizado" junto com a tabela já preenchida
+    # (aviso de uma pesquisa anterior), então a tabela com linhas sempre tem prioridade
+    # e o aviso só é aceito depois de permanecer sozinho por alguns segundos.
+    titulo = page.get_by_text(re.compile(r"Segunda Via de Boletos", re.I))
+    limite = time.monotonic() + TIMEOUT_CARREGAMENTO_MS / 1_000
+    aviso_desde: float | None = None
     while time.monotonic() < limite:
-        tabela = tabela_boletos(page)
-        if tabela.count() and tabela.is_visible(timeout=500):
+        if tabela_com_linhas_visivel(page):
             logger.info("Tela Segunda Via de Boletos carregada com tabela.")
             return
         if aviso_sem_registros(page):
-            logger.info("Tela Segunda Via de Boletos carregada sem registros.")
-            return
+            aviso_desde = aviso_desde or time.monotonic()
+            if time.monotonic() - aviso_desde >= 8:
+                logger.info("Tela Segunda Via de Boletos carregada sem registros.")
+                return
+        else:
+            aviso_desde = None
         page.wait_for_timeout(500)
-    raise RuntimeError("Tela de boletos aberta, mas sem tabela nem aviso de ausência de registros.")
+    raise RuntimeError(
+        "A tela Segunda Via de Boletos não exibiu a tabela nem o aviso de ausência de registros "
+        f"em {TIMEOUT_CARREGAMENTO_MS // 1_000} segundos (título visível: "
+        f"{'SIM' if algum_visivel(titulo) else 'NAO'}; URL: {page.url})."
+    )
 
 
 def cabecalhos_fisicos(tabela: Locator, quantidade_colunas: int) -> list[str]:
@@ -683,6 +724,7 @@ def salvar_download_com_nome(download: Download, destino: Path) -> tuple[Path, b
 def aguardar_nova_janela(
     contexto: BrowserContext,
     paginas_antes: set[Page],
+    pagina_espera: Page,
     timeout_segundos: int = 15,
 ) -> Page | None:
     limite = time.monotonic() + timeout_segundos
@@ -690,7 +732,9 @@ def aguardar_nova_janela(
         novas = [pagina for pagina in contexto.pages if pagina not in paginas_antes]
         if novas:
             return novas[-1]
-        time.sleep(0.25)
+        # Na API síncrona, novas abas só são registradas durante chamadas ao Playwright;
+        # time.sleep() bloquearia esse processamento e a janela nunca seria detectada.
+        pagina_espera.wait_for_timeout(250)
     return None
 
 
@@ -892,15 +936,21 @@ def obter_bytes_blob(
             """
             async (url) => {
                 let blob = null;
-                if (window.__roboBlobsCriados && window.__roboBlobsCriados.has(url)) {
-                    blob = window.__roboBlobsCriados.get(url);
-                } else if (window.__roboBlobsCriados && window.__roboBlobsCriados.size) {
-                    const blobs = Array.from(window.__roboBlobsCriados.values());
-                    blob = blobs[blobs.length - 1];
+                const criados = window.__roboBlobsCriados;
+                if (criados && criados.has(url)) {
+                    blob = criados.get(url);
                 } else {
-                    const resposta = await fetch(url);
-                    blob = await resposta.blob();
+                    try {
+                        const resposta = await fetch(url);
+                        if (resposta.ok) blob = await resposta.blob();
+                    } catch (_) {}
+                    // Último recurso: o Blob mais recente criado pela página.
+                    if (!blob && criados && criados.size) {
+                        const blobs = Array.from(criados.values());
+                        blob = blobs[blobs.length - 1];
+                    }
                 }
+                if (!blob) throw new Error('Blob indisponível nesta página');
                 const buffer = await blob.arrayBuffer();
                 const bytes = new Uint8Array(buffer);
                 let binario = '';
@@ -966,6 +1016,91 @@ def tentar_pdf_blob_em_paginas(
         if caminho is not None:
             return caminho
     return None
+
+
+OPCOES_PDF_PAGINA = {
+    "format": "A4",
+    "print_background": True,
+    "margin": {"top": "10mm", "right": "10mm", "bottom": "10mm", "left": "10mm"},
+    "scale": 0.70,  # Escala reduzida para 70% para garantir que tabelas largas caibam na folha
+}
+
+CSS_PDF_PAGINA = """
+    * {
+        overflow: visible !important;
+        white-space: normal !important;
+        word-wrap: break-word !important;
+    }
+    body, html, form, table {
+        width: 100% !important;
+        max-width: 100% !important;
+        min-width: 0 !important;
+        margin: 0 auto !important;
+    }
+"""
+
+
+def html_com_base(conteudo_html: str, url_base: str) -> str:
+    """Inclui <base href> para que CSS e imagens relativos carreguem fora da página original."""
+    if re.search(r"<base\s", conteudo_html, re.I):
+        return conteudo_html
+    marcador = f'<base href="{html.escape(url_base, quote=True)}">'
+    if re.search(r"<head[^>]*>", conteudo_html, re.I):
+        return re.sub(r"<head[^>]*>", lambda m: m.group(0) + marcador, conteudo_html, count=1, flags=re.I)
+    return marcador + conteudo_html
+
+
+def gerar_pdf_da_pagina(pagina: Page, logger: logging.Logger) -> bytes:
+    """Gera o PDF do conteúdo exibido sem usar a impressora.
+
+    Tenta page.pdf() na própria página. Versões do Chromium/Edge que só geram PDF sem
+    janela (headless) recusam esse comando com o robô visível; nesse caso o HTML já
+    ajustado é renderizado em um navegador headless temporário, com os mesmos cookies
+    e com JavaScript desativado (cópia estática da página).
+    """
+    pagina.emulate_media(media="screen")
+    pagina.add_style_tag(content=CSS_PDF_PAGINA)
+    pagina.wait_for_timeout(1_000)
+    try:
+        return pagina.pdf(**OPCOES_PDF_PAGINA)
+    except Exception as exc:
+        logger.info(
+            "DIAGNOSTICO_PDF | ETAPA=PDF_DA_PAGINA | AVISO=PDF_DIRETO_INDISPONIVEL | MOTIVO=%s",
+            exc,
+        )
+
+    navegador = pagina.context.browser
+    if navegador is None:
+        raise RuntimeError("Navegador da página indisponível para gerar o PDF.")
+    conteudo_html = html_com_base(pagina.content(), pagina.url)
+    estado_sessao = pagina.context.storage_state()
+    canais = ("msedge", None) if PREFERIR_MICROSOFT_EDGE else (None, "msedge")
+    erros: list[str] = []
+    for canal in canais:
+        try:
+            opcoes = {"headless": True}
+            if canal:
+                opcoes["channel"] = canal
+            navegador_pdf = navegador.browser_type.launch(**opcoes)
+        except Exception as exc:
+            erros.append(f"{canal or 'chromium'}: {exc}")
+            continue
+        try:
+            contexto_pdf = navegador_pdf.new_context(storage_state=estado_sessao, java_script_enabled=False)
+            pagina_pdf = contexto_pdf.new_page()
+            pagina_pdf.set_content(conteudo_html, wait_until="load", timeout=TIMEOUT_CARREGAMENTO_MS)
+            pagina_pdf.emulate_media(media="screen")
+            logger.info(
+                "DIAGNOSTICO_PDF | ETAPA=PDF_DA_PAGINA | METODO=NAVEGADOR_HEADLESS | CANAL=%s",
+                canal or "chromium",
+            )
+            return pagina_pdf.pdf(**OPCOES_PDF_PAGINA)
+        finally:
+            try:
+                navegador_pdf.close()
+            except Exception:
+                pass
+    raise RuntimeError("Nenhum navegador headless disponível para gerar o PDF: " + " | ".join(erros))
 
 
 def salvar_pagina_sem_impressora(
@@ -1036,51 +1171,20 @@ def salvar_pagina_sem_impressora(
         if caminho is not None:
             return caminho, False
 
-    if permitir_pdf_da_pagina:
+    if permitir_pdf_da_pagina and pagina_resultado.url.startswith("blob:"):
+        # Uma aba blob: é o visualizador de PDF; gerar PDF dela resultaria em página vazia.
+        logger.error(
+            "DIAGNOSTICO_PDF | ETAPA=PDF_DA_PAGINA | BLOQUEADO=SIM | MOTIVO=PAGINA_E_VISUALIZADOR_BLOB"
+        )
+    elif permitir_pdf_da_pagina:
         try:
-            # Força o navegador a usar o estilo visual da tela
-            pagina_resultado.emulate_media(media="screen")
-            
-            # Injeta CSS para forçar a quebra de texto, remover barras de rolagem e ajustar larguras
-            pagina_resultado.add_style_tag(content="""
-                * {
-                    overflow: visible !important;
-                    white-space: normal !important;
-                    word-wrap: break-word !important;
-                }
-                body, html, form, table {
-                    width: 100% !important;
-                    max-width: 100% !important;
-                    min-width: 0 !important;
-                    margin: 0 auto !important;
-                }
-            """)
-            
-            # Aguarda a aplicação do CSS e renderização
-            pagina_resultado.wait_for_timeout(1000)
-
-            conteudo_gerado = pagina_resultado.pdf(
-                format="A4",
-                print_background=True,
-                margin={"top": "10mm", "right": "10mm", "bottom": "10mm", "left": "10mm"},
-                scale=0.70  # Escala reduzida para 70% para garantir que tabelas largas caibam na folha
-            )
-            
+            conteudo_gerado = gerar_pdf_da_pagina(pagina_resultado, logger)
             if bytes_sao_pdf(conteudo_gerado):
                 logger.warning(
                     "DIAGNOSTICO_PDF | ETAPA=PDF_DA_PAGINA | AVISO=PDF_GERADO_A_PARTIR_DA_PAGINA_HTML"
                 )
                 return gravar_pdf_atomico(conteudo_gerado, destino), False
-        except Exception as exc:
-            logger.error(
-                "DIAGNOSTICO_PDF | ETAPA=PDF_DA_PAGINA | ERRO=%s",
-                exc,
-            )
-            if bytes_sao_pdf(conteudo_gerado):
-                logger.warning(
-                    "DIAGNOSTICO_PDF | ETAPA=PDF_DA_PAGINA | AVISO=PDF_GERADO_A_PARTIR_DA_PAGINA_HTML"
-                )
-                return gravar_pdf_atomico(conteudo_gerado, destino), False
+            logger.error("DIAGNOSTICO_PDF | ETAPA=PDF_DA_PAGINA | ERRO=CONTEUDO_GERADO_NAO_E_PDF")
         except Exception as exc:
             logger.error(
                 "DIAGNOSTICO_PDF | ETAPA=PDF_DA_PAGINA | ERRO=%s",
@@ -1097,9 +1201,8 @@ def salvar_pagina_sem_impressora(
         destino,
     )
     raise RuntimeError(
-        "Não foi possível capturar o PDF original com segurança. Consulte no log as linhas "
-        "iniciadas por DIAGNOSTICO_PDF. Nenhum PDF com aparência de print foi criado e "
-        "nenhum comando foi enviado à impressora."
+        "Não foi possível capturar o PDF original nem gerar o PDF da página. Consulte no log "
+        "as linhas iniciadas por DIAGNOSTICO_PDF. Nenhum comando foi enviado à impressora."
     )
 
 
@@ -1129,6 +1232,8 @@ def renomear_arquivo_baixado(caminho: Path, nome_final: str, logger: logging.Log
         return caminho, False
     if destino.exists() and destino.stat().st_size > 0:
         logger.info("Arquivo final já existente; mantendo: %s", destino.name)
+        # Remove a cópia temporária para não deixar arquivos duplicados na pasta.
+        caminho.unlink(missing_ok=True)
         return destino, True
     caminho.replace(destino)
     logger.info("Arquivo renomeado: %s -> %s", caminho.name, destino.name)
@@ -1266,7 +1371,7 @@ def clicar_e_salvar_resultado(
                 conteudo = obter_bytes_blob(page, url_blob, logger)
                 if conteudo_binario_valido(conteudo or b"", destino.suffix):
                     return gravar_arquivo_atomico(conteudo or b"", destino), False
-            time.sleep(0.25)
+            page.wait_for_timeout(250)
         raise TimeoutError(
             f"O portal não disparou download, popup nem Blob válido em {TIMEOUT_DOWNLOAD_MS // 1_000} segundos."
         )
@@ -1298,6 +1403,7 @@ def baixar_nf_prefeitura(
     pasta_destino: Path,
     logger: logging.Logger,
 ) -> tuple[Path, bool]:
+    paginas_iniciais = set(contexto.pages)
     page = contexto.new_page()
     respostas_capturadas: list[Response] = []
 
@@ -1323,7 +1429,7 @@ def baixar_nf_prefeitura(
             contexto.on("response", registrar_resposta)
             verificar.click()
         with etapa_registrada(logger, "PREFEITURA_IDENTIFICAR_PAGINA_RESULTADO", **contexto_log):
-            pagina_secundaria = aguardar_nova_janela(contexto, paginas_antes)
+            pagina_secundaria = aguardar_nova_janela(contexto, paginas_antes, page)
         pagina_resultado = pagina_secundaria if pagina_secundaria is not None else page
         if pagina_secundaria is not None:
             logger.info("A nota fiscal abriu em uma segunda janela; capturando o PDF sem usar impressão.")
@@ -1377,16 +1483,13 @@ def baixar_nf_prefeitura(
             contexto.remove_listener("response", registrar_resposta)
         except Exception:
             pass
+        # Fecha todas as abas abertas pela consulta, inclusive visualizadores blob:.
         for pagina in list(contexto.pages):
-            if pagina is not page and "camacari.ba.gov.br" in pagina.url:
+            if pagina not in paginas_iniciais:
                 try:
                     pagina.close()
                 except Exception:
                     pass
-        try:
-            page.close()
-        except Exception:
-            pass
 
 
 def baixar_notas_codigo(
@@ -1423,6 +1526,15 @@ def baixar_notas_codigo(
             "ARQUIVO": "",
             "DETALHE": "",
         }
+        nome_final = f"{nome_seguro(credencial.contrato)}_NFS_{nome_seguro(numero)}_{nome_seguro(codigo)}.pdf"
+        destino_final = pasta_codigo / nome_final
+        if destino_final.exists() and destino_final.stat().st_size > 0:
+            registro["STATUS_DOWNLOAD"] = "JA_EXISTENTE"
+            registro["ARQUIVO"] = destino_final.name
+            ignorados += 1
+            logger.info("NFS-e %s do código %s já existente: %s", numero, codigo, destino_final.name)
+            dados.registros_notas.append(registro)
+            continue
         try:
             caminho, existente = baixar_nf_prefeitura(
                 contexto,
@@ -1433,11 +1545,7 @@ def baixar_notas_codigo(
                 pasta_codigo,
                 logger,
             )
-            caminho, nome_final_existente = renomear_arquivo_baixado(
-                caminho,
-                f"{nome_seguro(credencial.contrato)}_NFS_{nome_seguro(numero)}_{nome_seguro(codigo)}.pdf",
-                logger,
-            )
+            caminho, nome_final_existente = renomear_arquivo_baixado(caminho, nome_final, logger)
             existente = existente or nome_final_existente
             registro["STATUS_DOWNLOAD"] = "JA_EXISTENTE" if existente else "BAIXADO"
             registro["ARQUIVO"] = caminho.name
@@ -1858,25 +1966,39 @@ def processar_conta(
                     dados_linha.numero,
                 )
 
-                with etapa_registrada(
-                    logger,
-                    "PROCESSAR_NOTAS_CODIGO",
-                    **contexto_conta,
-                    codigo=codigo,
-                ):
-                    notas, ignoradas, falhas_nf = baixar_notas_codigo(
-                        page,
-                        contexto,
-                        linha,
-                        credencial,
-                        codigo,
-                        pasta_codigo,
+                try:
+                    with etapa_registrada(
                         logger,
-                        dados,
+                        "PROCESSAR_NOTAS_CODIGO",
+                        **contexto_conta,
+                        codigo=codigo,
+                    ):
+                        notas, ignoradas, falhas_nf = baixar_notas_codigo(
+                            page,
+                            contexto,
+                            linha,
+                            credencial,
+                            codigo,
+                            pasta_codigo,
+                            logger,
+                            dados,
+                        )
+                    resultado.notas_baixadas += notas
+                    resultado.ignorados += ignoradas
+                    resultado.falhas += falhas_nf
+                except Exception as exc:
+                    # Como no boleto e nos relatórios: registra a falha e segue para os demais downloads.
+                    resultado.falhas += 1
+                    logger.exception(
+                        "ETAPA_ROBO | STATUS=ERRO | ETAPA=PROCESSAR_NOTAS | CODIGO=%s | TIPO_ERRO=%s | ERRO=%s",
+                        codigo,
+                        type(exc).__name__,
+                        exc,
                     )
-                resultado.notas_baixadas += notas
-                resultado.ignorados += ignoradas
-                resultado.falhas += falhas_nf
+                    try:
+                        fechar_modal_notas(page)
+                    except Exception:
+                        pass
 
                 try:
                     with etapa_registrada(
@@ -2127,7 +2249,11 @@ def executar_robo(
 ) -> None:
     base = pasta_do_script()
     pasta_logs = base / NOME_PASTA_LOGS
-    logger, arquivo_log, arquivo_erros = configurar_logger(pasta_logs, fila_log)
+    try:
+        logger, arquivo_log, arquivo_erros = configurar_logger(pasta_logs, fila_log)
+    except Exception as exc:
+        callback_final(False, f"Não foi possível criar a pasta de logs:\n{pasta_logs}\n\n{exc}")
+        return
     resultados: list[ResultadoConta] = []
     dados = DadosExecucao()
     inicio = time.monotonic()
@@ -2256,6 +2382,7 @@ class Aplicacao:
         self.root.geometry("940x720")
         self.root.minsize(780, 580)
         self.fila_log: queue.Queue[str] = queue.Queue()
+        self.fila_final: queue.Queue[tuple[bool, str]] = queue.Queue()
         planilha_automatica = procurar_planilha_existente(pasta_do_script())
         self.planilha_var = StringVar(value=str(planilha_automatica) if planilha_automatica else "")
         self.pasta_var = StringVar(value=str(pasta_do_script() / NOME_PASTA_DOWNLOADS))
@@ -2378,7 +2505,8 @@ class Aplicacao:
         ).start()
 
     def finalizar_threadsafe(self, sucesso: bool, mensagem: str) -> None:
-        self.root.after(0, lambda: self.finalizar(sucesso, mensagem))
+        # Chamado pela thread do robô: só enfileira; a janela é atualizada em atualizar_console().
+        self.fila_final.put((sucesso, mensagem))
 
     def finalizar(self, sucesso: bool, mensagem: str) -> None:
         self.botao_iniciar.config(state="normal")
@@ -2397,6 +2525,12 @@ class Aplicacao:
                 self.console.config(state="disabled")
         except queue.Empty:
             pass
+        try:
+            sucesso, mensagem = self.fila_final.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            self.finalizar(sucesso, mensagem)
         self.root.after(150, self.atualizar_console)
 
     def executar(self) -> None:
