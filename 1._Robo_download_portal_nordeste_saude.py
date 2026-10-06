@@ -3,11 +3,14 @@ from __future__ import annotations
 import base64
 import csv
 import html
+import json
 import logging
 import os
 import queue
 import re
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -23,11 +26,11 @@ from urllib.parse import urljoin
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from playwright.sync_api import (
-    Browser,
     BrowserContext,
     Download,
     Locator,
     Page,
+    Playwright,
     Response,
     TimeoutError as PlaywrightTimeoutError,
     sync_playwright,
@@ -64,6 +67,19 @@ MAXIMO_TENTATIVAS_CONTA = 2
 MAXIMO_TENTATIVAS_DOWNLOAD = 2
 EXECUTAR_VISIVEL = True
 PREFERIR_MICROSOFT_EDGE = True
+
+# Preferências gravadas no perfil temporário do navegador. Com o visualizador de PDF
+# desligado, o Edge/Chromium BAIXA o PDF (inclusive os abertos em nova aba via blob:)
+# em vez de exibi-lo; o download é capturado pelo Playwright. A gravação do portal
+# mostrou que o boleto (SegundaViaBoleto/Gerar2Via), a Coparticipação e a Relação das
+# Boletas em PDF abriam no visualizador e só eram salvos ao clicar em "Baixar".
+PREFERENCIAS_NAVEGADOR = {
+    "plugins": {"always_open_pdf_externally": True},
+    "download": {"prompt_for_download": False, "open_pdf_in_system_reader": False},
+}
+
+# Canal (msedge ou Chromium do Playwright) que abriu com sucesso; reutilizado nas contas seguintes.
+ESTADO_NAVEGADOR: dict[str, object] = {"playwright": None, "canal": None}
 
 SCRIPT_CAPTURA_BLOB = r"""
 (() => {
@@ -384,8 +400,56 @@ def aguardar_carregamento(page: Page, pausa_ms: int = 1_000) -> None:
     page.wait_for_timeout(pausa_ms)
 
 
+def criar_perfil_temporario() -> Path:
+    perfil = Path(tempfile.mkdtemp(prefix="robo_nordeste_perfil_"))
+    (perfil / "Default").mkdir(parents=True, exist_ok=True)
+    (perfil / "Default" / "Preferences").write_text(json.dumps(PREFERENCIAS_NAVEGADOR), encoding="utf-8")
+    return perfil
+
+
+def abrir_contexto_navegador(
+    playwright: Playwright,
+    logger: logging.Logger,
+) -> tuple[BrowserContext, Path]:
+    """Abre um navegador com perfil próprio e limpo, que baixa PDFs em vez de exibi-los."""
+    opcoes = {
+        "headless": not EXECUTAR_VISIVEL,
+        "args": ["--start-maximized"],
+        "accept_downloads": True,
+        "no_viewport": True,
+    }
+    canal_salvo = ESTADO_NAVEGADOR.get("canal")
+    if canal_salvo is not None:
+        canais: tuple[str, ...] = (str(canal_salvo),)
+    elif PREFERIR_MICROSOFT_EDGE:
+        canais = ("msedge", "")
+    else:
+        canais = ("",)
+    ultimo_erro: Exception | None = None
+    for canal in canais:
+        perfil = criar_perfil_temporario()
+        try:
+            contexto = playwright.chromium.launch_persistent_context(
+                str(perfil),
+                **({"channel": canal} if canal else {}),
+                **opcoes,
+            )
+        except Exception as exc:
+            ultimo_erro = exc
+            shutil.rmtree(perfil, ignore_errors=True)
+            if canal == "msedge":
+                logger.warning("Microsoft Edge indisponível; usando Chromium: %s", exc)
+            continue
+        if ESTADO_NAVEGADOR.get("canal") is None:
+            ESTADO_NAVEGADOR["canal"] = canal
+            logger.info("Navegador utilizado: %s.", "Microsoft Edge" if canal == "msedge" else "Chromium")
+        return contexto, perfil
+    raise RuntimeError(f"Não foi possível abrir o navegador: {ultimo_erro}")
+
+
 def abrir_portal_empresa(contexto: BrowserContext, logger: logging.Logger) -> Page:
-    page = contexto.new_page()
+    # O perfil persistente já abre com uma aba em branco; ela é reutilizada.
+    page = contexto.pages[0] if contexto.pages else contexto.new_page()
     page.goto(URL_SITE, wait_until="domcontentloaded", timeout=TIMEOUT_CARREGAMENTO_MS)
     paginas_antes = set(contexto.pages)
     link = page.locator(f"xpath={XPATH_SOU_EMPRESA}")
@@ -717,7 +781,16 @@ def salvar_download_com_nome(download: Download, destino: Path) -> tuple[Path, b
             pass
         return destino, True
     destino.parent.mkdir(parents=True, exist_ok=True)
-    download.save_as(destino)
+    temporario = destino.with_name(f"{destino.name}.parcial")
+    download.save_as(temporario)
+    conteudo = temporario.read_bytes()
+    if not conteudo_binario_valido(conteudo, destino.suffix):
+        temporario.unlink(missing_ok=True)
+        raise ValueError(
+            f"O download '{download.suggested_filename}' não contém um arquivo {destino.suffix or 'válido'} "
+            "(o portal pode ter devolvido uma página de erro)."
+        )
+    temporario.replace(destino)
     return destino, False
 
 
@@ -1069,9 +1142,13 @@ def gerar_pdf_da_pagina(pagina: Page, logger: logging.Logger) -> bytes:
             exc,
         )
 
-    navegador = pagina.context.browser
-    if navegador is None:
-        raise RuntimeError("Navegador da página indisponível para gerar o PDF.")
+    playwright_atual = ESTADO_NAVEGADOR.get("playwright")
+    if pagina.context.browser is not None:
+        tipo_navegador = pagina.context.browser.browser_type
+    elif playwright_atual is not None:
+        tipo_navegador = playwright_atual.chromium  # type: ignore[attr-defined]
+    else:
+        raise RuntimeError("Navegador indisponível para gerar o PDF.")
     conteudo_html = html_com_base(pagina.content(), pagina.url)
     estado_sessao = pagina.context.storage_state()
     canais = ("msedge", None) if PREFERIR_MICROSOFT_EDGE else (None, "msedge")
@@ -1081,7 +1158,7 @@ def gerar_pdf_da_pagina(pagina: Page, logger: logging.Logger) -> bytes:
             opcoes = {"headless": True}
             if canal:
                 opcoes["channel"] = canal
-            navegador_pdf = navegador.browser_type.launch(**opcoes)
+            navegador_pdf = tipo_navegador.launch(**opcoes)
         except Exception as exc:
             erros.append(f"{canal or 'chromium'}: {exc}")
             continue
@@ -1320,7 +1397,11 @@ def clicar_e_salvar_resultado(
         downloads.append(download)
 
     def ao_pagina(nova_pagina: Page) -> None:
+        if nova_pagina in paginas_evento:
+            return
         paginas_evento.append(nova_pagina)
+        # PDFs abertos em nova aba (boleto, blob:) chegam como download nessa aba.
+        nova_pagina.on("download", ao_download)
 
     def ao_resposta(resposta: Response) -> None:
         respostas.append(resposta)
@@ -1358,6 +1439,13 @@ def clicar_e_salvar_resultado(
                     codigo,
                     descricao,
                 )
+                # A aba nova normalmente vira download (PDF) ou fecha sozinha (CSV);
+                # aguarda o download antes de tentar ler o conteúdo da aba.
+                limite_download = time.monotonic() + 10
+                while not downloads and time.monotonic() < limite_download and not pagina_secundaria.is_closed():
+                    page.wait_for_timeout(250)
+                if downloads or pagina_secundaria.is_closed():
+                    continue
                 return salvar_arquivo_nova_aba(
                     pagina_secundaria,
                     page,
@@ -1381,6 +1469,7 @@ def clicar_e_salvar_resultado(
             (page, "popup", ao_pagina),
             (page.context, "page", ao_pagina),
             (page.context, "response", ao_resposta),
+            *((pagina, "download", ao_download) for pagina in paginas_evento),
         ):
             try:
                 emissor.remove_listener(evento, funcao)
@@ -1406,9 +1495,19 @@ def baixar_nf_prefeitura(
     paginas_iniciais = set(contexto.pages)
     page = contexto.new_page()
     respostas_capturadas: list[Response] = []
+    downloads_nf: list[Download] = []
 
     def registrar_resposta(resposta: Response) -> None:
         respostas_capturadas.append(resposta)
+
+    def registrar_download(download: Download) -> None:
+        downloads_nf.append(download)
+
+    def registrar_pagina(nova_pagina: Page) -> None:
+        nova_pagina.on("download", registrar_download)
+
+    page.on("download", registrar_download)
+    contexto.on("page", registrar_pagina)
 
     try:
         contexto_log = {"codigo": codigo_portal, "nota": numero_nota}
@@ -1442,6 +1541,12 @@ def baixar_nf_prefeitura(
             aguardar_carregamento(pagina_resultado, 2_000)
 
         destino = pasta_destino / f"NFSe_{nome_seguro(codigo_portal)}_{nome_seguro(numero_nota)}.pdf"
+        if downloads_nf:
+            # Com o visualizador de PDF desligado, uma NFS-e em PDF chega como download.
+            with etapa_registrada(logger, "PREFEITURA_SALVAR_DOWNLOAD", **contexto_log):
+                caminho, existente = salvar_download_com_nome(downloads_nf[0], destino)
+            logger.info("NFS-e %s do código %s salva pelo download do navegador.", numero_nota, codigo_portal)
+            return caminho, existente
         ultimo_erro = ""
         for tentativa in range(1, MAXIMO_TENTATIVAS_DOWNLOAD + 1):
             try:
@@ -1479,10 +1584,15 @@ def baixar_nf_prefeitura(
                 pagina_resultado.wait_for_timeout(1_000)
         raise RuntimeError(f"A NFS-e {numero_nota} não foi salva como PDF: {ultimo_erro}")
     finally:
-        try:
-            contexto.remove_listener("response", registrar_resposta)
-        except Exception:
-            pass
+        for emissor, evento, funcao in (
+            (contexto, "response", registrar_resposta),
+            (contexto, "page", registrar_pagina),
+            (page, "download", registrar_download),
+        ):
+            try:
+                emissor.remove_listener(evento, funcao)
+            except Exception:
+                pass
         # Fecha todas as abas abertas pela consulta, inclusive visualizadores blob:.
         for pagina in list(contexto.pages):
             if pagina not in paginas_iniciais:
@@ -1770,11 +1880,8 @@ def baixar_boleto_codigo(
                 numero=numero,
                 tentativa=f"{tentativa}/{MAXIMO_TENTATIVAS_DOWNLOAD}",
             ):
-                # Equivale aos XPaths absolutos informados, por exemplo:
-                # /html/body/main/div[3]/div[3]/div[1]/table/tbody/tr[1]/td[1]/button[2]
-                # /html/body/main/div[3]/div[3]/div[1]/table/tbody/tr[4]/td[1]/button[2]
-                botao = linha.locator("xpath=./td[1]/button[2]")
-                if not botao.count():
+                botao = localizar_botao_boleto(linha)
+                if botao is None:
                     logger.warning("Código %s: botão de download do boleto indisponível.", codigo)
                     return "INDISPONIVEL", False
 
@@ -1813,6 +1920,28 @@ def baixar_boleto_codigo(
             )
             page.wait_for_timeout(1_000)
     raise RuntimeError(f"Código {codigo}, boleto: {ultimo_erro}")
+
+
+def localizar_botao_boleto(linha: Locator) -> Locator | None:
+    """Localiza o botão "Emitir 2ª Via" da coluna Ações.
+
+    A gravação do portal mostrou a estrutura td > div > button (o botão é o 2º da div);
+    o XPath antigo ./td[1]/button[2] não incluía a div e nunca encontrava o botão.
+    """
+    botoes = linha.locator("xpath=./td[1]//button")
+    for indice in range(botoes.count()):
+        botao = botoes.nth(indice)
+        partes = [
+            texto(botao.get_attribute("title")),
+            texto(botao.get_attribute("data-original-title")),
+            texto(botao.get_attribute("aria-label")),
+            texto(botao.inner_text()),
+        ]
+        descricao = normalizar(" ".join(partes))
+        if "emitir" in descricao or ("2" in descricao and "via" in descricao):
+            return botao
+    botao_posicao = linha.locator("xpath=./td[1]//button[2]").first
+    return botao_posicao if botao_posicao.count() else None
 
 
 def localizar_indice_relatorio(relatorios: Locator, tipo_relatorio: str) -> int | None:
@@ -1868,7 +1997,7 @@ def salvar_evidencia(page: Page | None, pasta_logs: Path, linha_excel: int) -> N
 
 
 def processar_conta(
-    browser: Browser,
+    playwright: Playwright,
     credencial: Credencial,
     vigencia_escolhida: str,
     pasta_downloads: Path,
@@ -1884,6 +2013,7 @@ def processar_conta(
     ultimo_erro = ""
     for tentativa in range(1, MAXIMO_TENTATIVAS_CONTA + 1):
         contexto: BrowserContext | None = None
+        perfil: Path | None = None
         page: Page | None = None
         try:
             logger.info(
@@ -1899,7 +2029,7 @@ def processar_conta(
                 "tentativa": f"{tentativa}/{MAXIMO_TENTATIVAS_CONTA}",
             }
             with etapa_registrada(logger, "CRIAR_CONTEXTO_NAVEGADOR", **contexto_conta):
-                contexto = browser.new_context(accept_downloads=True, no_viewport=True)
+                contexto, perfil = abrir_contexto_navegador(playwright, logger)
                 contexto.set_default_timeout(TIMEOUT_PADRAO_MS)
                 contexto.add_init_script(SCRIPT_CAPTURA_BLOB)
             with etapa_registrada(logger, "ABRIR_PORTAL_EMPRESA", **contexto_conta):
@@ -2113,6 +2243,8 @@ def processar_conta(
                     contexto.close()
                 except Exception:
                     pass
+            if perfil is not None:
+                shutil.rmtree(perfil, ignore_errors=True)
     resultado.status = "ERRO"
     resultado.falhas += 1
     resultado.detalhe = ultimo_erro
@@ -2287,20 +2419,8 @@ def executar_robo(
         logger.info("Linhas ativas a processar: %s", len(credenciais))
 
         with sync_playwright() as playwright:
-            opcoes_navegador = {
-                "headless": not EXECUTAR_VISIVEL,
-                "args": ["--start-maximized"],
-            }
-            with etapa_registrada(logger, "ABRIR_NAVEGADOR"):
-                if PREFERIR_MICROSOFT_EDGE:
-                    try:
-                        browser = playwright.chromium.launch(channel="msedge", **opcoes_navegador)
-                        logger.info("Navegador utilizado: Microsoft Edge.")
-                    except Exception as exc:
-                        logger.warning("Microsoft Edge indisponível; usando Chromium: %s", exc)
-                        browser = playwright.chromium.launch(**opcoes_navegador)
-                else:
-                    browser = playwright.chromium.launch(**opcoes_navegador)
+            # Cada conta abre o próprio navegador (perfil limpo que baixa PDFs); ver abrir_contexto_navegador.
+            ESTADO_NAVEGADOR.update(playwright=playwright, canal=None)
             try:
                 for posicao, credencial in enumerate(credenciais, start=1):
                     logger.info(
@@ -2319,7 +2439,7 @@ def executar_robo(
                     ):
                         resultados.append(
                             processar_conta(
-                                browser,
+                                playwright,
                                 credencial,
                                 vigencia,
                                 pasta_destino,
@@ -2329,8 +2449,7 @@ def executar_robo(
                             )
                         )
             finally:
-                with etapa_registrada(logger, "FECHAR_NAVEGADOR"):
-                    browser.close()
+                ESTADO_NAVEGADOR.update(playwright=None)
 
         with etapa_registrada(logger, "SALVAR_PLANILHA_RESULTADOS", vigencia=vigencia):
             planilha_saida = salvar_planilha_resultados(dados, resultados, pasta_destino, vigencia)
