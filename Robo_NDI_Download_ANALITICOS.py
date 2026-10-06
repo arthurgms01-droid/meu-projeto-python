@@ -67,6 +67,7 @@ Configurações opcionais (.env ou variáveis de ambiente):
     PULAR_CONTRATO_CONCLUIDO=1           0 = sempre reabre contratos já concluídos
     TIPOS_FATURA=MENSALIDADE,COPARTICIPACAO  tipos de fatura a processar
     USAR_INTERFACE=1                     0 = não mostra a tela de seleção (usa o .env)
+    SOLICITAR_GERACAO_RELATORIO=0        1 = clica em "Gerar relatório" quando o arquivo não existe
 
 Tela de seleção (tkinter):
     Ao iniciar, uma janela pergunta o tipo de fatura (Mensalidade/Coparticipação),
@@ -239,6 +240,12 @@ class HapvidaNDIAnaliticosAutomation:
     )
     # --- FIM INSERÇÃO CONFIRMAÇÃO PRECISA DAS TELAS ---
 
+    # --- INÍCIO INSERÇÃO RELATÓRIO AINDA NÃO GERADO PELO PORTAL ---
+    # Situações em que repetir a tentativa não adianta: o arquivo ainda não foi
+    # gerado pelo portal (ou a geração acabou de ser solicitada).
+    STATUS_AGUARDANDO_PORTAL = {"AGUARDANDO_GERACAO", "GERACAO_SOLICITADA", "SOLICITACAO_NAO_CONFIRMADA"}
+    # --- FIM INSERÇÃO RELATÓRIO AINDA NÃO GERADO PELO PORTAL ---
+
     TIMEOUT_CURTO = 5_000
     TIMEOUT_PADRAO = 20_000
     TIMEOUT_LONGO = 60_000
@@ -292,6 +299,15 @@ class HapvidaNDIAnaliticosAutomation:
         self.filtrar_tipos_fatura = set(self.tipos_fatura_selecionados) != set(self.PRIORIDADE_TIPOS)
         self.sem_fatura_do_tipo_atual = False
         # --- FIM INSERÇÃO FILTRO POR TIPO DE FATURA ---
+
+        # --- INÍCIO INSERÇÃO RELATÓRIO AINDA NÃO GERADO PELO PORTAL ---
+        # Quando o portal mostra "Gerar relatório" no lugar de "Baixar relatório",
+        # o arquivo ainda não existe. SOLICITAR_GERACAO_RELATORIO=1 faz o robô
+        # clicar uma vez em "Gerar relatório" (padrão 0: apenas registra).
+        self.solicitar_geracao_relatorio = os.getenv(
+            "SOLICITAR_GERACAO_RELATORIO", "0"
+        ).strip().lower() in valores_verdadeiros
+        # --- FIM INSERÇÃO RELATÓRIO AINDA NÃO GERADO PELO PORTAL ---
 
         self.extrair_zip_ativo = os.getenv("EXTRAIR_ZIP_ANALITICO", "1").strip().lower() in valores_verdadeiros
         self.timeout_download_analitico = int(os.getenv("TIMEOUT_DOWNLOAD_ANALITICO_MS", "60000"))
@@ -428,6 +444,10 @@ class HapvidaNDIAnaliticosAutomation:
             "arquivos_extraidos_zip": 0,
             "contratos_pulados_concluidos": 0,
             "contratos_sem_fatura_do_tipo": 0,
+            "relatorios_aguardando_geracao": 0,
+            "relatorios_geracao_solicitada": 0,
+            "relatorios_solicitacao_nao_confirmada": 0,
+            "arquivos_identicos_reaproveitados": 0,
         }
         self.inicializar_controle_txt()
         self.documentos_ok_controle = self.carregar_documentos_ok_controle()
@@ -946,6 +966,12 @@ class HapvidaNDIAnaliticosAutomation:
                 return "JA BAIXADO / SEM DUPLICAR"
             return "SUCESSO COMPLETO"
 
+        # --- INÍCIO INSERÇÃO RELATÓRIO AINDA NÃO GERADO PELO PORTAL ---
+        pendentes = [status for status in valores if status not in concluidos]
+        if pendentes and all(status in self.STATUS_AGUARDANDO_PORTAL for status in pendentes):
+            return "AGUARDANDO GERACAO NO PORTAL"
+        # --- FIM INSERÇÃO RELATÓRIO AINDA NÃO GERADO PELO PORTAL ---
+
         if any(status in concluidos for status in valores):
             return "SUCESSO PARCIAL / PENDENCIA"
 
@@ -970,6 +996,16 @@ class HapvidaNDIAnaliticosAutomation:
         if any(status in concluidos for status in status_documentos):
             return "PARCIAL"
         return "SEM_DOWNLOAD"
+
+    def contrato_so_aguarda_portal(self):
+        """True quando tudo o que falta no contrato depende só da geração no portal."""
+        pendentes = []
+        for evidencia in self.evidencias_contrato_atual:
+            status_docs = evidencia.get("status_docs", {}) or {}
+            for doc in self.DOCUMENTOS_PERMITIDOS:
+                if doc in status_docs and status_docs[doc] not in {"OK", "JA_BAIXADO"}:
+                    pendentes.append(status_docs[doc])
+        return bool(pendentes) and all(status in self.STATUS_AGUARDANDO_PORTAL for status in pendentes)
 
     def montar_detalhes_resultado_contrato(self):
         detalhes = list(self.docs_linha_atual)
@@ -1125,6 +1161,10 @@ class HapvidaNDIAnaliticosAutomation:
         print(f"Contratos com erro: {self.resumo_execucao['contratos_erro']}")
         print(f"Contratos pulados (já concluídos antes): {self.resumo_execucao.get('contratos_pulados_concluidos', 0)}")
         print(f"Contratos sem fatura do tipo selecionado: {self.resumo_execucao.get('contratos_sem_fatura_do_tipo', 0)}")
+        print(f"Relatórios aguardando geração no portal: {self.resumo_execucao.get('relatorios_aguardando_geracao', 0)}")
+        print(f"Relatórios com geração solicitada pelo robô: {self.resumo_execucao.get('relatorios_geracao_solicitada', 0)}")
+        print(f"Solicitações de geração não confirmadas: {self.resumo_execucao.get('relatorios_solicitacao_nao_confirmada', 0)}")
+        print(f"Arquivos idênticos reaproveitados (sem _1): {self.resumo_execucao.get('arquivos_identicos_reaproveitados', 0)}")
         print(f"Faturas processadas: {self.resumo_execucao['faturas_processadas']}")
         print(f"Arquivos baixados nesta execução: {self.resumo_execucao['arquivos_baixados']}")
         print(f"Arquivos pulados por duplicidade: {self.resumo_execucao['arquivos_pulados']}")
@@ -1832,18 +1872,47 @@ class HapvidaNDIAnaliticosAutomation:
             return nome
         return ""
 
+    def montar_nome_destino(self, nome_original, novo_nome_base, ext):
+        """(base, extensão) do arquivo: nome original ou, sem ele, o nome padrão."""
+        nome_original = self.limpar_nome_original(nome_original)
+        if nome_original:
+            return Path(nome_original).stem, (Path(nome_original).suffix or ext)
+        return self.limpar_nome_arquivo(novo_nome_base), ext
+
+    def caminho_sem_contador(self, pasta_destino, nome_original, novo_nome_base, ext):
+        base, ext = self.montar_nome_destino(nome_original, novo_nome_base, ext)
+        return pasta_destino / f"{base}{ext}"
+
+    def reaproveitar_arquivo_identico(self, caminho_salvo, caminho_original):
+        """
+        Se o arquivo recém-salvo ganhou _1/_2 porque já existia um arquivo com o
+        nome original E o conteúdo é idêntico (tamanho + SHA-256), apaga a cópia
+        e devolve o arquivo existente. Conteúdo diferente: mantém os dois.
+        """
+        try:
+            caminho_salvo = Path(caminho_salvo)
+            caminho_original = Path(caminho_original)
+            if caminho_salvo == caminho_original or not caminho_original.exists():
+                return caminho_salvo
+            if caminho_salvo.stat().st_size != caminho_original.stat().st_size:
+                return caminho_salvo
+            if self.calcular_sha256_arquivo(caminho_salvo) != self.calcular_sha256_arquivo(caminho_original):
+                return caminho_salvo
+            caminho_salvo.unlink()
+            self.resumo_execucao["arquivos_identicos_reaproveitados"] += 1
+            print(f"Arquivo idêntico já existia na pasta; reaproveitado sem duplicar: {caminho_original.name}")
+            return caminho_original
+        except Exception as e:
+            print(f"[AVISO] Não foi possível comparar com o arquivo existente: {self.resumir_erro(e)}")
+            return caminho_salvo
+
     def montar_caminho_destino(self, pasta_destino, nome_original, novo_nome_base, ext):
         """
         Usa o nome original quando existir; o nome padrão do robô fica apenas
         como contingência (ex.: PDF capturado por Blob, que não tem nome).
         O contador _1, _2... só é usado para nunca sobrescrever um arquivo.
         """
-        nome_original = self.limpar_nome_original(nome_original)
-        if nome_original:
-            base = Path(nome_original).stem
-            ext = Path(nome_original).suffix or ext
-        else:
-            base = self.limpar_nome_arquivo(novo_nome_base)
+        base, ext = self.montar_nome_destino(nome_original, novo_nome_base, ext)
 
         caminho = pasta_destino / f"{base}{ext}"
         contador = 1
@@ -1883,6 +1952,10 @@ class HapvidaNDIAnaliticosAutomation:
         # --- FIM INSERÇÃO PASTA ÚNICA POR TIPO / NOME ORIGINAL ---
 
         download.save_as(str(caminho))
+        caminho = self.reaproveitar_arquivo_identico(
+            caminho,
+            self.caminho_sem_contador(pasta_destino, suggested, novo_nome_base, ext),
+        )
         print(f"Arquivo salvo: {caminho.name}")
         return caminho
 
@@ -2500,6 +2573,10 @@ class HapvidaNDIAnaliticosAutomation:
 
             with open(caminho, "wb") as f:
                 f.write(conteudo)
+            caminho = self.reaproveitar_arquivo_identico(
+                caminho,
+                self.caminho_sem_contador(pasta_destino, nome_original, novo_nome_base, ext),
+            )
 
             print(f"Arquivo salvo por fallback de URL: {caminho.name}")
             return caminho
@@ -3845,56 +3922,197 @@ class HapvidaNDIAnaliticosAutomation:
 
         return ocorrencias
 
-    def abrir_fatura_por_ocorrencia(self, ocorrencia, vencimento_alvo, navegar=True):
+    # --- INÍCIO INSERÇÃO ABERTURA CONFIÁVEL DA FATURA ---
+    # Correção do contrato 0WFTA (06/10/2026): depois do clique na aba Histórico,
+    # a tabela foi lida enquanto ainda mostrava a aba Em aberto; a fatura não foi
+    # achada e o robô seguiu com o índice de linha antigo. O clique + TAB + ENTER
+    # caiu no lugar errado e a espera ficou 60s parada. Agora:
+    #   1. a linha só é usada depois de vista na tabela (vencimento + tipo);
+    #   2. a fatura é aberta pela seta (›) da própria linha;
+    #   3. a tela de detalhes é confirmada em até 20s, com uma nova tentativa.
+    TIMEOUT_ABRIR_DETALHES_FATURA = 20_000
+
+    def indices_linhas_da_fatura(self, vencimento_alvo, tipo_fatura):
+        """Índices (na ordem de //tr) das linhas VISÍVEIS com o vencimento e o tipo."""
+        try:
+            return self.page.evaluate(
+                """
+                ([vencimento, tipo, tiposConhecidos]) => {
+                    const visivel = (el) => {
+                        const r = el.getBoundingClientRect();
+                        const s = window.getComputedStyle(el);
+                        return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+                    };
+                    const indices = [];
+                    Array.from(document.querySelectorAll('tr')).forEach((tr, indice) => {
+                        const texto = (tr.innerText || '').toUpperCase().replace(/\\s+/g, ' ');
+                        if (!texto.includes(vencimento) || !visivel(tr)) return;
+                        const casaTipo = tipo === 'OUTRO'
+                            ? !tiposConhecidos.some((t) => texto.includes(t))
+                            : texto.includes(tipo);
+                        if (casaTipo) indices.push(indice);
+                    });
+                    return indices;
+                }
+                """,
+                [str(vencimento_alvo), str(tipo_fatura), list(self.PRIORIDADE_TIPOS)],
+            ) or []
+        except Exception:
+            return []
+
+    def localizar_linha_fatura_na_aba(self, ocorrencia, vencimento_alvo, clicar_aba=True, timeout_s=12.0):
+        """
+        Posiciona a aba/página e só retorna quando a linha da fatura estiver
+        visível na tabela. Se a tabela não trocar, clica na aba de novo.
+        Nunca devolve um índice que não foi confirmado na tela atual.
+        """
         tab_nome = ocorrencia["tab"]
         pagina = ocorrencia["pagina"]
-        linha_index = ocorrencia["linha_index"]
         tipo_fatura = ocorrencia["tipo_fatura"]
+        linha_anterior = ocorrencia.get("linha_index")
 
-        if navegar:
+        inicio = time.monotonic()
+        ultimo_clique = inicio
+        cliques_aba = 0
+        if clicar_aba:
             self.navegar_para_aba_e_pagina(tab_nome, pagina)
-            # --- INÍCIO INSERÇÃO RECONFERÊNCIA DA LINHA DA FATURA ---
-            # O índice da linha foi obtido em uma leitura anterior da tabela. Depois
-            # de voltar de outra fatura a ordem pode ter mudado (faturas com o mesmo
-            # vencimento), então a linha é localizada de novo pelo tipo da fatura.
-            try:
-                ocorrencias_atuais = self.pesquisar_ocorrencias_na_tela(vencimento_alvo, tab_nome, pagina)
-                indices_do_tipo = [
-                    oc["linha_index"] for oc in ocorrencias_atuais
-                    if oc.get("tipo_fatura") == tipo_fatura
-                ]
-                if indices_do_tipo and linha_index not in indices_do_tipo:
+            cliques_aba = 1
+            ultimo_clique = time.monotonic()
+
+        while True:
+            indices = self.indices_linhas_da_fatura(vencimento_alvo, tipo_fatura)
+            if indices:
+                linha = linha_anterior if linha_anterior in indices else indices[0]
+                if linha != linha_anterior:
                     print(
-                        f"[AVISO] A fatura {tipo_fatura} mudou da linha {linha_index} "
-                        f"para a linha {indices_do_tipo[0]}. Usando a linha atual."
+                        f"[AVISO] A fatura {tipo_fatura} está na linha {linha} "
+                        f"(antes: {linha_anterior}). Usando a linha confirmada na tela."
                     )
-                    linha_index = indices_do_tipo[0]
-                    ocorrencia["linha_index"] = linha_index
-            except Exception as e:
-                print(f"[AVISO] Não foi possível reconferir a linha da fatura: {self.resumir_erro(e)}")
-            # --- FIM INSERÇÃO RECONFERÊNCIA DA LINHA DA FATURA ---
+                ocorrencia["linha_index"] = linha
+                return linha
 
-        print(f"Abrindo fatura {tipo_fatura} na linha {linha_index}...")
-        linhas = self.page.locator("xpath=//tr")
-        linha = linhas.nth(linha_index)
+            agora = time.monotonic()
+            if agora - inicio >= timeout_s:
+                raise RuntimeError(
+                    f"A fatura {tipo_fatura} de {vencimento_alvo} não apareceu na aba "
+                    f"{tab_nome} (página {pagina}) em {timeout_s:.0f}s."
+                )
+            # A tabela não trocou de aba: clica na aba novamente (até 3 vezes no total).
+            if agora - ultimo_clique >= 4.0 and cliques_aba < 3:
+                print(
+                    f"[AVISO] A fatura {tipo_fatura} de {vencimento_alvo} ainda não aparece "
+                    f"na tabela. Clicando de novo na aba {tab_nome}..."
+                )
+                try:
+                    self.navegar_para_aba_e_pagina(tab_nome, pagina)
+                except Exception as e:
+                    print(f"[AVISO] Falha ao clicar de novo na aba: {self.resumir_erro(e)}")
+                cliques_aba += 1
+                ultimo_clique = time.monotonic()
+            try:
+                self.page.wait_for_timeout(400)
+            except Exception:
+                time.sleep(0.4)
 
-        celula_vencimento = linha.locator(f"xpath=.//*[contains(normalize-space(.), '{vencimento_alvo}')]" ).first
+    def clicar_seta_da_linha(self, linha_index, vencimento_alvo):
+        """Clica na seta (›) da linha. Retorna False se a linha não tiver botão."""
+        linha = self.page.locator("xpath=//tr").nth(linha_index)
+        try:
+            botoes = linha.locator("button, a, [role='button']")
+            for indice in range(botoes.count() - 1, -1, -1):
+                botao = botoes.nth(indice)
+                if botao.is_visible():
+                    try:
+                        botao.scroll_into_view_if_needed(timeout=self.TIMEOUT_CURTO)
+                    except Exception:
+                        pass
+                    print(f"Abrindo a fatura pela seta da linha {linha_index}...")
+                    botao.click(timeout=self.TIMEOUT_PADRAO)
+                    return True
+        except Exception as e:
+            print(f"[AVISO] Não foi possível clicar na seta da linha: {self.resumir_erro(e)}")
+        return False
+
+    def abrir_fatura_pelo_teclado(self, linha_index, vencimento_alvo):
+        """Método anterior (célula do vencimento + TAB + ENTER), mantido como contingência."""
+        linha = self.page.locator("xpath=//tr").nth(linha_index)
+        celula_vencimento = linha.locator(f"xpath=.//*[contains(normalize-space(.), '{vencimento_alvo}')]").first
         celula_vencimento.wait_for(state="visible", timeout=self.TIMEOUT_PADRAO)
-
         self.clicar_e_aguardar(celula_vencimento, "célula do vencimento", usar_networkidle=False)
-
         print("Executando TAB 1x + ENTER para entrar na fatura...")
         self.page.keyboard.press("Tab")
         time.sleep(0.4)
         self.page.keyboard.press("Enter")
 
-        # Clique seguido de espera explícita pela próxima tela.
+    def aguardar_detalhes_fatura(self, timeout_ms=None):
+        """Espera a tela Detalhes da fatura (URL /detalhes/ ou título visível)."""
+        timeout_ms = timeout_ms or self.TIMEOUT_ABRIR_DETALHES_FATURA
+        limite = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < limite:
+            if self.tela_detalhes_fatura_aberta():
+                return True
+            try:
+                self.page.wait_for_timeout(300)
+            except Exception:
+                time.sleep(0.3)
+        return self.tela_detalhes_fatura_aberta()
+
+    def garantir_lista_de_faturas(self):
+        """Volta para a lista de faturas se a aba tiver saído dela."""
+        try:
+            self.page.wait_for_selector(self.SELETOR_TELA_EXTRATO, state="visible", timeout=3_000)
+            return
+        except Exception:
+            pass
+        if self.url_extrato_atual:
+            print("Voltando para a lista de faturas pela URL do extrato...")
+            self.page.goto(self.url_extrato_atual, wait_until="domcontentloaded", timeout=self.TIMEOUT_LONGO)
+        else:
+            self.page.go_back(wait_until="domcontentloaded", timeout=self.TIMEOUT_LONGO)
         self.aguardar_selector(
-            "xpath=//*[contains(normalize-space(.), 'Detalhes da fatura') or contains(normalize-space(.), 'Relatórios') or contains(normalize-space(.), 'Relatorios')]",
-            descricao="tela Detalhes da fatura/Relatórios",
-            timeout=self.TIMEOUT_LONGO,
+            self.SELETOR_TELA_EXTRATO,
+            descricao="lista de faturas",
+            timeout=self.TIMEOUT_PADRAO,
         )
-        self.respirar_sistema(timeout=20_000, segundos_fallback=2)
+
+    def abrir_fatura_por_ocorrencia(self, ocorrencia, vencimento_alvo, navegar=True):
+        tab_nome = ocorrencia["tab"]
+        pagina = ocorrencia["pagina"]
+        tipo_fatura = ocorrencia["tipo_fatura"]
+
+        for tentativa_abertura in (1, 2):
+            if tentativa_abertura > 1:
+                self.garantir_lista_de_faturas()
+
+            # 1. Linha confirmada na tela (clica na aba quando necessário).
+            linha_index = self.localizar_linha_fatura_na_aba(
+                ocorrencia,
+                vencimento_alvo,
+                clicar_aba=navegar or tentativa_abertura > 1,
+            )
+
+            # 2. Seta da linha; o teclado fica como contingência.
+            print(f"Abrindo fatura {tipo_fatura} na linha {linha_index} (tentativa {tentativa_abertura}/2)...")
+            if not self.clicar_seta_da_linha(linha_index, vencimento_alvo):
+                print("[AVISO] Seta da linha não encontrada. Usando célula do vencimento + TAB + ENTER...")
+                self.abrir_fatura_pelo_teclado(linha_index, vencimento_alvo)
+
+            # 3. Confirmação da tela de detalhes.
+            if self.aguardar_detalhes_fatura():
+                self.respirar_sistema(timeout=20_000, segundos_fallback=2)
+                return True
+
+            print(
+                f"[AVISO] A tela Detalhes da fatura não abriu em "
+                f"{self.TIMEOUT_ABRIR_DETALHES_FATURA / 1000:.0f}s (tentativa {tentativa_abertura}/2)."
+            )
+            self.salvar_screenshot(f"fatura_nao_abriu_T{tentativa_abertura}")
+
+        raise RuntimeError(
+            f"A fatura {tipo_fatura} de {vencimento_alvo} (aba {tab_nome}, página {pagina}) "
+            "não abriu após 2 tentativas."
+        )
+    # --- FIM INSERÇÃO ABERTURA CONFIÁVEL DA FATURA ---
 
     def aguardar_tela_fatura(self):
         try:
@@ -4269,6 +4487,13 @@ class HapvidaNDIAnaliticosAutomation:
                     "OK" if sucesso else "FALHA",
                     detalhes_tentativa,
                 )
+
+            # --- INÍCIO INSERÇÃO RELATÓRIO AINDA NÃO GERADO PELO PORTAL ---
+            status_doc = self.status_docs_fatura_atual.get(doc, "")
+            if not sucesso and status_doc in self.STATUS_AGUARDANDO_PORTAL:
+                print(f"[{doc}] {status_doc}: o arquivo depende do portal; sem nova tentativa.")
+                return False
+            # --- FIM INSERÇÃO RELATÓRIO AINDA NÃO GERADO PELO PORTAL ---
 
             if not sucesso:
                 self.registrar_diagnostico_se_ausente(
@@ -5851,10 +6076,171 @@ class HapvidaNDIAnaliticosAutomation:
 
                 with pacote.open(item) as origem, open(destino, "wb") as saida:
                     shutil.copyfileobj(origem, saida)
+                destino = self.reaproveitar_arquivo_identico(
+                    destino,
+                    self.caminho_sem_contador(pasta_destino, nome_membro, nome_padrao, extensao),
+                )
                 print(f"Arquivo extraído do ZIP: {destino.name}")
                 extraidos.append(destino)
 
         return extraidos
+
+    # --- INÍCIO INSERÇÃO RELATÓRIO AINDA NÃO GERADO PELO PORTAL ---
+    SCRIPT_LINHAS_RELATORIO = """
+        () => {
+            const limpar = (t) => (t || '').replace(/\\s+/g, ' ').trim();
+            const seletor = 'button, a, [role="button"]';
+            const visivel = (el) => {
+                const r = el.getBoundingClientRect();
+                const s = window.getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+            };
+            const todos = Array.from(document.querySelectorAll(seletor));
+            return todos.map((el, indice) => {
+                let bloco = el;
+                let pai = el.parentElement;
+                while (pai && pai.querySelectorAll(seletor).length <= 1) {
+                    bloco = pai;
+                    pai = pai.parentElement;
+                }
+                return {
+                    indice: indice,
+                    texto: limpar(el.innerText || el.textContent).slice(0, 80),
+                    linha: limpar(bloco.innerText || bloco.textContent).slice(0, 160),
+                    visivel: visivel(el),
+                    desabilitado: !!el.disabled || el.getAttribute('aria-disabled') === 'true'
+                };
+            }).filter((b) => b.visivel);
+        }
+    """
+
+    def verificar_relatorio_a_gerar(self, formato, page=None):
+        """
+        Lê a linha do formato na seção Relatórios. Retorna:
+        - None: há "Baixar relatório" para o formato (ou a linha não foi
+          reconhecida) -> segue o fluxo normal de download;
+        - {"situacao": "GERAR", ...}: o portal mostra "Gerar relatório";
+        - {"situacao": "EM_GERACAO", ...}: a linha indica solicitação em andamento.
+        """
+        page = page or self.page
+        fmt = str(formato or "").upper()
+        try:
+            botoes = page.evaluate(self.SCRIPT_LINHAS_RELATORIO) or []
+        except Exception:
+            return None
+
+        da_linha = [b for b in botoes if re.match(rf"^{fmt}(\W|$)", str(b.get("linha", "")).upper())]
+        if any("BAIXAR RELAT" in str(b.get("texto", "")).upper() and not b.get("desabilitado") for b in da_linha):
+            return None
+        for b in da_linha:
+            if "GERAR RELAT" in str(b.get("texto", "")).upper():
+                return {"situacao": "GERAR", "indice": b.get("indice"), "linha": b.get("linha", "")}
+
+        # Linha sem botão (ex.: após a solicitação): procura o texto logo abaixo do formato.
+        try:
+            texto = page.locator("body").inner_text(timeout=self.TIMEOUT_CURTO)
+        except Exception:
+            texto = ""
+        m = re.search(rf"\n\s*{fmt}\s*\n([^\n]{{0,120}})", texto)
+        if m and re.search(r"process|solicitad|aguard|gerando|andamento", m.group(1), re.IGNORECASE):
+            return {"situacao": "EM_GERACAO", "indice": None, "linha": f"{fmt} {m.group(1).strip()}"}
+        return None
+
+    def solicitar_geracao_relatorio_no_portal(self, fmt, situacao, page=None):
+        """
+        Clica uma única vez em "Gerar relatório" e observa a reação do portal.
+        Uma janela de confirmação NÃO é confirmada automaticamente.
+        Retorna (status, detalhe).
+        """
+        page = page or self.page
+        botao = page.locator("button, a, [role='button']").nth(int(situacao["indice"]))
+        try:
+            if "GERAR RELAT" not in str(botao.inner_text(timeout=self.TIMEOUT_CURTO)).upper():
+                return "SOLICITACAO_NAO_CONFIRMADA", "O botão Gerar relatório mudou antes do clique."
+        except Exception as e:
+            return "SOLICITACAO_NAO_CONFIRMADA", f"Botão Gerar relatório não acessível: {self.resumir_erro(e)}"
+
+        padrao_aviso = re.compile(r"solicita|sucesso|processamento|gerad", re.IGNORECASE)
+        try:
+            avisos_antes = len(padrao_aviso.findall(page.locator("body").inner_text(timeout=self.TIMEOUT_CURTO)))
+        except Exception:
+            avisos_antes = 0
+
+        print(f'Clicando uma única vez em "Gerar relatório" ({fmt})...')
+        botao.click(timeout=self.TIMEOUT_PADRAO)
+
+        seletor_dialogo = "[role='dialog'], [role='alertdialog'], [aria-modal='true'], .MuiDialog-root"
+        limite = time.monotonic() + 8.0
+        while time.monotonic() < limite:
+            try:
+                if page.locator(seletor_dialogo).first.is_visible():
+                    self.salvar_screenshot(f"gerar_relatorio_{fmt}_confirmacao")
+                    try:
+                        texto_dialogo = page.locator(seletor_dialogo).first.inner_text(timeout=2_000)
+                    except Exception:
+                        texto_dialogo = ""
+                    try:
+                        page.keyboard.press("Escape")
+                    except Exception:
+                        pass
+                    return (
+                        "SOLICITACAO_NAO_CONFIRMADA",
+                        "O portal abriu uma janela de confirmação, que não foi confirmada "
+                        f"automaticamente: '{self.limpar_campo_txt(texto_dialogo)[:200]}'.",
+                    )
+            except Exception:
+                pass
+
+            nova = self.verificar_relatorio_a_gerar(fmt, page=page)
+            if not nova or nova.get("situacao") != "GERAR":
+                return "GERACAO_SOLICITADA", f"Geração solicitada; a linha passou a mostrar: '{(nova or {}).get('linha', 'sem Gerar relatório')}'."
+            try:
+                avisos_depois = len(padrao_aviso.findall(page.locator("body").inner_text(timeout=2_000)))
+            except Exception:
+                avisos_depois = avisos_antes
+            if avisos_depois > avisos_antes:
+                return "GERACAO_SOLICITADA", "Geração solicitada; o portal exibiu um aviso de solicitação."
+            try:
+                page.wait_for_timeout(400)
+            except Exception:
+                time.sleep(0.4)
+
+        self.salvar_screenshot(f"gerar_relatorio_{fmt}_sem_reacao")
+        return (
+            "SOLICITACAO_NAO_CONFIRMADA",
+            "Gerar relatório foi clicado, mas a tela não mostrou confirmação em 8s.",
+        )
+
+    def tratar_relatorio_nao_gerado(self, documento, fmt, situacao):
+        """Registra o relatório ainda não gerado (e solicita, se configurado). Sem novas tentativas."""
+        linha = situacao.get("linha", "")
+        if situacao.get("situacao") == "EM_GERACAO":
+            status = "AGUARDANDO_GERACAO"
+            mensagem = f"Relatório {fmt} em geração pelo portal ('{linha}'). Baixar em nova execução."
+        elif not self.solicitar_geracao_relatorio:
+            status = "AGUARDANDO_GERACAO"
+            mensagem = (
+                f"O portal mostra 'Gerar relatório' para o {fmt}: o arquivo ainda não foi gerado. "
+                "Para o robô solicitar, marque 'Solicitar geração' na tela de seleção."
+            )
+        else:
+            try:
+                status, detalhe = self.solicitar_geracao_relatorio_no_portal(fmt, situacao, page=self.page)
+            except Exception as e:
+                status, detalhe = "SOLICITACAO_NAO_CONFIRMADA", f"Falha ao clicar em Gerar relatório: {self.resumir_erro(e)}"
+            mensagem = f"{detalhe} O portal informa disponibilização em até 24h; baixar em nova execução."
+
+        contador = {
+            "AGUARDANDO_GERACAO": "relatorios_aguardando_geracao",
+            "GERACAO_SOLICITADA": "relatorios_geracao_solicitada",
+            "SOLICITACAO_NAO_CONFIRMADA": "relatorios_solicitacao_nao_confirmada",
+        }[status]
+        self.resumo_execucao[contador] += 1
+        print(f"[{documento}] {status}: {mensagem}")
+        self.registrar_rastreamento_download(documento, status, validacao=status)
+        self.marcar_documento_fatura(documento, status, mensagem)
+        return False
+    # --- FIM INSERÇÃO RELATÓRIO AINDA NÃO GERADO PELO PORTAL ---
 
     def baixar_relatorio_analitico(self, contrato, vencimento_alvo, tipo_fatura, formato):
         fmt = str(formato or "").strip().upper()
@@ -5887,6 +6273,12 @@ class HapvidaNDIAnaliticosAutomation:
                 )
                 self.marcar_documento_fatura(documento, "ERRO", mensagem)
                 return False
+
+        # --- INÍCIO INSERÇÃO RELATÓRIO AINDA NÃO GERADO PELO PORTAL ---
+        situacao_geracao = self.verificar_relatorio_a_gerar(fmt, page=self.page)
+        if situacao_geracao:
+            return self.tratar_relatorio_nao_gerado(documento, fmt, situacao_geracao)
+        # --- FIM INSERÇÃO RELATÓRIO AINDA NÃO GERADO PELO PORTAL ---
 
         inicio_captura = time.perf_counter()
         resultado = None
@@ -6476,6 +6868,11 @@ class HapvidaNDIAnaliticosAutomation:
                         # --- INÍCIO INSERÇÃO PULAR CONTRATO JÁ CONCLUÍDO ---
                         self.registrar_contrato_concluido(contrato, vencimento)
                         # --- FIM INSERÇÃO PULAR CONTRATO JÁ CONCLUÍDO ---
+                    # --- INÍCIO INSERÇÃO RELATÓRIO AINDA NÃO GERADO PELO PORTAL ---
+                    elif resultado_contrato == "PARCIAL" and self.contrato_so_aguarda_portal():
+                        status = "Pendência - Aguardando geração de relatório no portal"
+                        self.resumo_execucao["contratos_pendencia"] += 1
+                    # --- FIM INSERÇÃO RELATÓRIO AINDA NÃO GERADO PELO PORTAL ---
                     elif resultado_contrato == "PARCIAL":
                         status = "Pendência - Download parcial"
                         self.resumo_execucao["contratos_pendencia"] += 1
@@ -6784,6 +7181,11 @@ class HapvidaNDIAnaliticosAutomation:
                     if resultado_contrato == "COMPLETO":
                         status = "Sucesso completo - Todos os documentos concluídos"
                         self.resumo_execucao["contratos_sucesso"] += 1
+                    # --- INÍCIO INSERÇÃO RELATÓRIO AINDA NÃO GERADO PELO PORTAL ---
+                    elif resultado_contrato == "PARCIAL" and self.contrato_so_aguarda_portal():
+                        status = "Pendência - Aguardando geração de relatório no portal"
+                        self.resumo_execucao["contratos_pendencia"] += 1
+                    # --- FIM INSERÇÃO RELATÓRIO AINDA NÃO GERADO PELO PORTAL ---
                     elif resultado_contrato == "PARCIAL":
                         status = "Pendência - Download parcial"
                         self.resumo_execucao["contratos_pendencia"] += 1
@@ -6919,6 +7321,7 @@ def valores_iniciais_interface(arquivo_excel_padrao, caminho_preferencias):
                   (t == "COPARTICIPACAO" and "COPARTICIPAÇÃO" in tipos_env)],
         "formatos": [f for f in ("CSV", "TXT", "PDF") if f in formatos_env],
         "boleto_nf": os.getenv("BAIXAR_BOLETO_NF", "0").strip().lower() in valores_verdadeiros,
+        "solicitar_geracao": os.getenv("SOLICITAR_GERACAO_RELATORIO", "0").strip().lower() in valores_verdadeiros,
         "workers": workers_env,
         "planilha": str(arquivo_excel_padrao),
     }
@@ -7001,13 +7404,21 @@ def abrir_interface_configuracao(arquivo_excel_padrao, caminho_preferencias):
     ttk.Checkbutton(grupo_opcoes, text="Baixar também Boleto e Nota Fiscal", variable=var_boleto_nf).grid(
         row=0, column=0, columnspan=3, sticky="w"
     )
-    ttk.Label(grupo_opcoes, text="Janelas em paralelo:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+    var_solicitar_geracao = tk.BooleanVar(value=bool(valores.get("solicitar_geracao")))
+    ttk.Checkbutton(
+        grupo_opcoes,
+        text='Solicitar geração quando o portal mostrar "Gerar relatório" (fica pronto em até 24h)',
+        variable=var_solicitar_geracao,
+    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+    linha_janelas = ttk.Frame(grupo_opcoes)
+    linha_janelas.grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+    ttk.Label(linha_janelas, text="Janelas em paralelo:").grid(row=0, column=0, sticky="w")
     var_workers = tk.StringVar(value=str(valores["workers"]))
-    ttk.Spinbox(grupo_opcoes, from_=1, to=4, width=4, textvariable=var_workers, state="readonly").grid(
-        row=1, column=1, sticky="w", padx=(6, 0), pady=(8, 0)
+    ttk.Spinbox(linha_janelas, from_=1, to=4, width=4, textvariable=var_workers, state="readonly").grid(
+        row=0, column=1, sticky="w", padx=(6, 0)
     )
-    ttk.Label(grupo_opcoes, text="(1 = uma janela, como antes)").grid(
-        row=1, column=2, sticky="w", padx=(6, 0), pady=(8, 0)
+    ttk.Label(linha_janelas, text="(1 = uma janela, como antes)").grid(
+        row=0, column=2, sticky="w", padx=(6, 0)
     )
 
     grupo_planilha = ttk.LabelFrame(quadro, text="Planilha de contratos", padding=10)
@@ -7050,6 +7461,7 @@ def abrir_interface_configuracao(arquivo_excel_padrao, caminho_preferencias):
             "tipos": tipos,
             "formatos": [f for f in ("CSV", "TXT", "PDF") if variaveis_formato[f].get()],
             "boleto_nf": bool(var_boleto_nf.get()),
+            "solicitar_geracao": bool(var_solicitar_geracao.get()),
             "workers": min(4, max(1, int(var_workers.get() or 1))),
             "planilha": var_planilha.get().strip(),
         }
@@ -7126,6 +7538,7 @@ def aplicar_escolha_interface(escolha):
     os.environ["TIPOS_FATURA"] = ",".join(escolha["tipos"])
     os.environ["FORMATOS_ANALITICOS"] = ",".join(escolha["formatos"])
     os.environ["BAIXAR_BOLETO_NF"] = "1" if escolha["boleto_nf"] else "0"
+    os.environ["SOLICITAR_GERACAO_RELATORIO"] = "1" if escolha.get("solicitar_geracao") else "0"
     os.environ["WORKERS_PARALELOS"] = str(escolha["workers"])
     return Path(escolha["planilha"])
 # --- FIM INSERÇÃO INTERFACE TKINTER (SELEÇÃO DO QUE BAIXAR) ---
@@ -7160,6 +7573,7 @@ if __name__ == "__main__":
                 "Seleção da tela: "
                 f"tipos={', '.join(escolha['tipos'])} | arquivos={', '.join(escolha['formatos'])} | "
                 f"boleto/NF={'sim' if escolha['boleto_nf'] else 'não'} | "
+                f"solicitar geração={'sim' if escolha.get('solicitar_geracao') else 'não'} | "
                 f"janelas={escolha['workers']} | planilha={arquivo_excel}"
             )
     # --- FIM INSERÇÃO INTERFACE TKINTER (SELEÇÃO DO QUE BAIXAR) ---
