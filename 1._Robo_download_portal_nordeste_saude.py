@@ -77,10 +77,14 @@ TIMEOUT_LOGIN_MANUAL_SEGUNDOS = 180
 MAXIMO_TENTATIVAS_CONTA = 2
 MAXIMO_TENTATIVAS_DOWNLOAD = 2
 EXECUTAR_VISIVEL = True
-PREFERIR_MICROSOFT_EDGE = True
+# Navegador usado pelo robô: "chrome" (Google Chrome instalado), "msedge" (Microsoft Edge)
+# ou "chromium" (Chromium do Playwright: py -m playwright install chromium).
+# Se o navegador escolhido não abrir, o robô usa o Chromium do Playwright.
+NAVEGADOR = "chrome"
+NOMES_NAVEGADOR = {"chrome": "Google Chrome", "msedge": "Microsoft Edge", "": "Chromium do Playwright"}
 
 # Preferências gravadas no perfil temporário do navegador. Com o visualizador de PDF
-# desligado, o Edge/Chromium BAIXA o PDF (inclusive os abertos em nova aba via blob:)
+# desligado, o Chrome/Chromium BAIXA o PDF (inclusive os abertos em nova aba via blob:)
 # em vez de exibi-lo; o download é capturado pelo Playwright. A gravação do portal
 # mostrou que o boleto (SegundaViaBoleto/Gerar2Via), a Coparticipação e a Relação das
 # Boletas em PDF abriam no visualizador e só eram salvos ao clicar em "Baixar".
@@ -89,7 +93,7 @@ PREFERENCIAS_NAVEGADOR = {
     "download": {"prompt_for_download": False, "open_pdf_in_system_reader": False},
 }
 
-# Canal (msedge ou Chromium do Playwright) que abriu com sucesso; reutilizado nas contas seguintes.
+# Canal (chrome, msedge ou "" para o Chromium do Playwright) que abriu com sucesso; reutilizado nas contas seguintes.
 ESTADO_NAVEGADOR: dict[str, object] = {"playwright": None, "canal": None}
 
 SCRIPT_CAPTURA_BLOB = r"""
@@ -430,10 +434,11 @@ def abrir_contexto_navegador(
         "no_viewport": True,
     }
     canal_salvo = ESTADO_NAVEGADOR.get("canal")
+    canal_preferido = "" if NAVEGADOR == "chromium" else NAVEGADOR
     if canal_salvo is not None:
         canais: tuple[str, ...] = (str(canal_salvo),)
-    elif PREFERIR_MICROSOFT_EDGE:
-        canais = ("msedge", "")
+    elif canal_preferido:
+        canais = (canal_preferido, "")
     else:
         canais = ("",)
     ultimo_erro: Exception | None = None
@@ -448,12 +453,16 @@ def abrir_contexto_navegador(
         except Exception as exc:
             ultimo_erro = exc
             shutil.rmtree(perfil, ignore_errors=True)
-            if canal == "msedge":
-                logger.warning("Microsoft Edge indisponível; usando Chromium: %s", exc)
+            if canal:
+                logger.warning(
+                    "%s indisponível; usando o Chromium do Playwright: %s",
+                    NOMES_NAVEGADOR.get(canal, canal),
+                    exc,
+                )
             continue
         if ESTADO_NAVEGADOR.get("canal") is None:
             ESTADO_NAVEGADOR["canal"] = canal
-            logger.info("Navegador utilizado: %s.", "Microsoft Edge" if canal == "msedge" else "Chromium")
+            logger.info("Navegador utilizado: %s.", NOMES_NAVEGADOR.get(canal, canal))
         return contexto, perfil
     raise RuntimeError(f"Não foi possível abrir o navegador: {ultimo_erro}")
 
@@ -1168,7 +1177,7 @@ def html_com_base(conteudo_html: str, url_base: str) -> str:
 def gerar_pdf_da_pagina(pagina: Page, logger: logging.Logger) -> bytes:
     """Gera o PDF do conteúdo exibido sem usar a impressora.
 
-    Tenta page.pdf() na própria página. Versões do Chromium/Edge que só geram PDF sem
+    Tenta page.pdf() na própria página. Versões do Chrome/Chromium que só geram PDF sem
     janela (headless) recusam esse comando com o robô visível; nesse caso o HTML já
     ajustado é renderizado em um navegador headless temporário, com os mesmos cookies
     e com JavaScript desativado (cópia estática da página).
@@ -1193,7 +1202,9 @@ def gerar_pdf_da_pagina(pagina: Page, logger: logging.Logger) -> bytes:
         raise RuntimeError("Navegador indisponível para gerar o PDF.")
     conteudo_html = html_com_base(pagina.content(), pagina.url)
     estado_sessao = pagina.context.storage_state()
-    canais = ("msedge", None) if PREFERIR_MICROSOFT_EDGE else (None, "msedge")
+    # Mesmo navegador que abriu com sucesso; o Chromium do Playwright fica como alternativa.
+    canal_atual = str(ESTADO_NAVEGADOR.get("canal") or "")
+    canais = tuple(dict.fromkeys((canal_atual or None, None)))
     erros: list[str] = []
     for canal in canais:
         try:
@@ -1501,7 +1512,7 @@ def clicar_e_salvar_resultado(
 
         def salvar_blob_da_pagina(url_blob: str) -> tuple[Path, bool] | None:
             # Lê o blob direto da página do portal: mesmo conteúdo do download, sem aguardar
-            # a verificação de segurança que o Edge faz ao concluir cada download.
+            # a verificação de segurança que o navegador faz ao concluir cada download.
             for pagina_blob in [page, *[p for p in paginas_evento if not p.is_closed()]]:
                 conteudo = obter_bytes_blob(pagina_blob, url_blob, logger)
                 if conteudo_binario_valido(conteudo or b"", destino.suffix):
@@ -1624,7 +1635,7 @@ def baixar_nf_prefeitura(
 
     # Captura o PDF da NFS-e na própria resposta da Prefeitura (requisição original do
     # navegador, sem reenvio). Necessário porque, com o leitor de PDF desligado, o
-    # relatório nfse.gerar.rel incorporado na página aparece apenas como aviso do Edge.
+    # relatório nfse.gerar.rel incorporado na página aparece apenas como aviso do navegador.
     pdfs_capturados: list[tuple[str, bytes]] = []
     padrao_prefeitura = re.compile(PADRAO_URL_PREFEITURA, re.I)
 
