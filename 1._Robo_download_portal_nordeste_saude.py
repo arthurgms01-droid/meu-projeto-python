@@ -1427,14 +1427,59 @@ def clicar_e_salvar_resultado(
         except Exception as exc:
             logger.warning("Não foi possível limpar o histórico de Blobs antes de '%s': %s", descricao, exc)
         elemento.wait_for(state="visible", timeout=TIMEOUT_PADRAO_MS)
+        inicio_clique = time.monotonic()
         elemento.click()
+        logger.info(
+            "DIAGNOSTICO_DOWNLOAD | CODIGO=%s | ARQUIVO=%s | ETAPA=CLIQUE | SEGUNDOS=%.2f",
+            codigo,
+            descricao,
+            time.monotonic() - inicio_clique,
+        )
+
+        def registrar_metodo(metodo: str, resultado: tuple[Path, bool]) -> tuple[Path, bool]:
+            logger.info(
+                "DIAGNOSTICO_DOWNLOAD | CODIGO=%s | ARQUIVO=%s | METODO=%s | SEGUNDOS_DESDE_CLIQUE=%.2f",
+                codigo,
+                descricao,
+                metodo,
+                time.monotonic() - inicio_clique,
+            )
+            return resultado
+
+        def salvar_blob_da_pagina(url_blob: str) -> tuple[Path, bool] | None:
+            # Lê o blob direto da página do portal: mesmo conteúdo do download, sem aguardar
+            # a verificação de segurança que o Edge faz ao concluir cada download.
+            for pagina_blob in [page, *[p for p in paginas_evento if not p.is_closed()]]:
+                conteudo = obter_bytes_blob(pagina_blob, url_blob, logger)
+                if conteudo_binario_valido(conteudo or b"", destino.suffix):
+                    if destino.exists() and destino.stat().st_size > 0:
+                        return destino, True
+                    return gravar_arquivo_atomico(conteudo or b"", destino), False
+            return None
+
         limite = time.monotonic() + (TIMEOUT_DOWNLOAD_MS / 1_000)
         while time.monotonic() < limite:
             if downloads:
                 download = downloads[0]
                 sufixo_real = Path(download.suggested_filename).suffix
                 destino_real = destino.with_suffix(sufixo_real) if sufixo_real else destino
-                return salvar_download_com_nome(download, destino_real)
+                if download.url.startswith("blob:") and destino_real.suffix == destino.suffix:
+                    resultado_blob = salvar_blob_da_pagina(download.url)
+                    if resultado_blob is not None:
+                        try:
+                            download.cancel()
+                        except Exception:
+                            pass
+                        return registrar_metodo("BLOB_DO_DOWNLOAD", resultado_blob)
+                inicio_salvar = time.monotonic()
+                resultado_download = salvar_download_com_nome(download, destino_real)
+                logger.info(
+                    "DIAGNOSTICO_DOWNLOAD | CODIGO=%s | ARQUIVO=%s | ETAPA=AGUARDAR_CONCLUSAO_DOWNLOAD | SEGUNDOS=%.2f",
+                    codigo,
+                    descricao,
+                    time.monotonic() - inicio_salvar,
+                )
+                return registrar_metodo("DOWNLOAD", resultado_download)
 
             novas_por_lista = [pagina for pagina in page.context.pages if pagina not in paginas_antes]
             candidatas = paginas_evento + novas_por_lista
@@ -1452,22 +1497,31 @@ def clicar_e_salvar_resultado(
                 # aguarda o download antes de tentar ler o conteúdo da aba.
                 limite_download = time.monotonic() + 10
                 while not downloads and time.monotonic() < limite_download and not pagina_secundaria.is_closed():
+                    # O arquivo pode já estar disponível como blob na página do portal.
+                    url_blob = ultimo_blob_criado(page)
+                    if url_blob:
+                        resultado_blob = salvar_blob_da_pagina(url_blob)
+                        if resultado_blob is not None:
+                            return registrar_metodo("BLOB_DA_PAGINA", resultado_blob)
                     page.wait_for_timeout(250)
                 if downloads or pagina_secundaria.is_closed():
                     continue
-                return salvar_arquivo_nova_aba(
-                    pagina_secundaria,
-                    page,
-                    destino,
-                    logger,
-                    respostas,
+                return registrar_metodo(
+                    "NOVA_ABA",
+                    salvar_arquivo_nova_aba(
+                        pagina_secundaria,
+                        page,
+                        destino,
+                        logger,
+                        respostas,
+                    ),
                 )
 
             url_blob = ultimo_blob_criado(page)
             if url_blob:
-                conteudo = obter_bytes_blob(page, url_blob, logger)
-                if conteudo_binario_valido(conteudo or b"", destino.suffix):
-                    return gravar_arquivo_atomico(conteudo or b"", destino), False
+                resultado_blob = salvar_blob_da_pagina(url_blob)
+                if resultado_blob is not None:
+                    return registrar_metodo("BLOB_DA_PAGINA", resultado_blob)
             page.wait_for_timeout(250)
         raise TimeoutError(
             f"O portal não disparou download, popup nem Blob válido em {TIMEOUT_DOWNLOAD_MS // 1_000} segundos."
@@ -1857,6 +1911,11 @@ def baixar_boletas_modal(
                         type(exc).__name__,
                         exc,
                     )
+                    # Modal aberto intercepta o clique no ícone na próxima tentativa.
+                    try:
+                        fechar_modal_notas(page)
+                    except Exception:
+                        pass
                     page.wait_for_timeout(1_000)
             if not concluido:
                 falhas += 1
