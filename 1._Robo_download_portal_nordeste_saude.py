@@ -43,6 +43,8 @@ from playwright.sync_api import (
 
 URL_SITE = "https://nordestesaude.com.br/"
 URL_PREFEITURA = "http://sefazweb.camacari.ba.gov.br/nfse/consultarAutenticidadeNFSe.tela"
+# Respostas deste domínio são inspecionadas para capturar o PDF original da NFS-e.
+PADRAO_URL_PREFEITURA = r"^https?://[^/]*camacari\.ba\.gov\.br/"
 
 NOME_BASE_PLANILHA = "NORDEST_CONTRATOS_DOWNLOAD"
 NOME_PASTA_DOWNLOADS = "Downloads_Nordeste_Saude"
@@ -824,6 +826,37 @@ def bytes_sao_pdf(conteudo: bytes) -> bool:
     return len(conteudo) >= 500 and conteudo.lstrip().startswith(b"%PDF-")
 
 
+def pdf_gerado_pelo_navegador(caminho: Path) -> bool:
+    """True para PDFs criados pela impressão da página (Skia/Chromium), não pelo emissor da nota.
+
+    Ao desligar o leitor de PDF, a consulta da Prefeitura passou a exibir o aviso
+    "O leitor de PDF foi desabilitado" e a impressão da página gerou NFS-e incorretas.
+    """
+    try:
+        conteudo = caminho.read_bytes()
+    except OSError:
+        return False
+    return b"Skia/PDF" in conteudo[-8192:] or b"Skia/PDF" in conteudo[:8192]
+
+
+def pagina_tem_pdf_incorporado(pagina: Page) -> bool:
+    """Detecta relatório PDF dentro de iframe/embed (ex.: nfse.gerar.rel da Prefeitura)."""
+    padrao = re.compile(r"\.rel(?:$|[?#])|gerar|relatorio|\.pdf(?:$|[?#])", re.I)
+    for frame in pagina.frames:
+        if frame is pagina.main_frame:
+            continue
+        if frame.url and frame.url != "about:blank" and padrao.search(frame.url):
+            return True
+    try:
+        return bool(
+            pagina.evaluate(
+                "() => !!document.querySelector('embed[type*=pdf], object[type*=pdf], iframe[src*=\".rel\"], iframe[src*=\".pdf\"]')"
+            )
+        )
+    except Exception:
+        return False
+
+
 def gravar_pdf_atomico(conteudo: bytes, destino: Path) -> Path:
     if not bytes_sao_pdf(conteudo):
         raise ValueError("O conteúdo recebido não possui uma assinatura PDF válida.")
@@ -1262,6 +1295,12 @@ def salvar_pagina_sem_impressora(
         logger.error(
             "DIAGNOSTICO_PDF | ETAPA=PDF_DA_PAGINA | BLOQUEADO=SIM | MOTIVO=PAGINA_E_VISUALIZADOR_BLOB"
         )
+    elif permitir_pdf_da_pagina and pagina_tem_pdf_incorporado(pagina_resultado):
+        # O documento real está num iframe/embed PDF; imprimir a página salvaria só a moldura
+        # (ou o aviso "O leitor de PDF foi desabilitado").
+        logger.error(
+            "DIAGNOSTICO_PDF | ETAPA=PDF_DA_PAGINA | BLOQUEADO=SIM | MOTIVO=PAGINA_COM_PDF_INCORPORADO"
+        )
     elif permitir_pdf_da_pagina:
         try:
             conteudo_gerado = gerar_pdf_da_pagina(pagina_resultado, logger)
@@ -1311,11 +1350,25 @@ def gravar_arquivo_atomico(conteudo: bytes, destino: Path) -> Path:
     return destino
 
 
-def renomear_arquivo_baixado(caminho: Path, nome_final: str, logger: logging.Logger) -> tuple[Path, bool]:
+def renomear_arquivo_baixado(
+    caminho: Path,
+    nome_final: str,
+    logger: logging.Logger,
+    substituir_gerado_pelo_navegador: bool = False,
+) -> tuple[Path, bool]:
     """Renomeia somente um arquivo já salvo e validado, sem alterar o download."""
     destino = caminho.with_name(nome_final)
     if caminho == destino:
         return caminho, False
+    if (
+        substituir_gerado_pelo_navegador
+        and destino.exists()
+        and pdf_gerado_pelo_navegador(destino)
+        and not pdf_gerado_pelo_navegador(caminho)
+    ):
+        caminho.replace(destino)
+        logger.info("Arquivo incorreto (impressão da página) substituído pelo original: %s", destino.name)
+        return destino, False
     if destino.exists() and destino.stat().st_size > 0:
         logger.info("Arquivo final já existente; mantendo: %s", destino.name)
         # Remove a cópia temporária para não deixar arquivos duplicados na pasta.
@@ -1569,6 +1622,32 @@ def baixar_nf_prefeitura(
     def registrar_pagina(nova_pagina: Page) -> None:
         nova_pagina.on("download", registrar_download)
 
+    # Captura o PDF da NFS-e na própria resposta da Prefeitura (requisição original do
+    # navegador, sem reenvio). Necessário porque, com o leitor de PDF desligado, o
+    # relatório nfse.gerar.rel incorporado na página aparece apenas como aviso do Edge.
+    pdfs_capturados: list[tuple[str, bytes]] = []
+    padrao_prefeitura = re.compile(PADRAO_URL_PREFEITURA, re.I)
+
+    def interceptar_prefeitura(route) -> None:
+        if route.request.resource_type not in ("document", "xhr", "fetch", "other"):
+            route.continue_()
+            return
+        try:
+            resposta = route.fetch(max_redirects=0, timeout=TIMEOUT_DOWNLOAD_MS)
+        except Exception:
+            route.continue_()
+            return
+        try:
+            tipo = resposta.headers.get("content-type", "").lower()
+            disposicao = resposta.headers.get("content-disposition", "").lower()
+            if "pdf" in tipo or "octet-stream" in tipo or ".pdf" in disposicao:
+                corpo = resposta.body()
+                if bytes_sao_pdf(corpo):
+                    pdfs_capturados.append((route.request.url, corpo))
+        except Exception as exc:
+            logger.warning("DIAGNOSTICO_PDF | ETAPA=INTERCEPTAR_PREFEITURA | ERRO=%s", exc)
+        route.fulfill(response=resposta)
+
     page.on("download", registrar_download)
     contexto.on("page", registrar_pagina)
 
@@ -1589,6 +1668,7 @@ def baixar_nf_prefeitura(
             verificar = page.locator(f"xpath={XPATH_VERIFICAR_PREFEITURA}")
             verificar.wait_for(state="visible", timeout=TIMEOUT_PADRAO_MS)
             contexto.on("response", registrar_resposta)
+            contexto.route(padrao_prefeitura, interceptar_prefeitura)
             verificar.click()
         with etapa_registrada(logger, "PREFEITURA_IDENTIFICAR_PAGINA_RESULTADO", **contexto_log):
             pagina_secundaria = aguardar_nova_janela(contexto, paginas_antes, page)
@@ -1604,6 +1684,25 @@ def baixar_nf_prefeitura(
             aguardar_carregamento(pagina_resultado, 2_000)
 
         destino = pasta_destino / f"NFSe_{nome_seguro(codigo_portal)}_{nome_seguro(numero_nota)}.pdf"
+        limite_captura = time.monotonic() + 15
+        while not pdfs_capturados and not downloads_nf and time.monotonic() < limite_captura:
+            pagina_resultado.wait_for_timeout(250)
+        if pdfs_capturados:
+            url_pdf, conteudo_pdf = pdfs_capturados[-1]
+            with etapa_registrada(logger, "PREFEITURA_SALVAR_PDF_ORIGINAL", **contexto_log):
+                gravar_pdf_atomico(conteudo_pdf, destino)
+            logger.info(
+                "NFS-e %s do código %s: PDF original capturado da resposta da Prefeitura (%s bytes): %s",
+                numero_nota,
+                codigo_portal,
+                len(conteudo_pdf),
+                url_pdf,
+            )
+            return destino, False
+        logger.warning(
+            "DIAGNOSTICO_PDF | ETAPA=INTERCEPTAR_PREFEITURA | AVISO=NENHUM_PDF_NA_RESPOSTA | NOTA=%s",
+            numero_nota,
+        )
         if downloads_nf:
             # Com o visualizador de PDF desligado, uma NFS-e em PDF chega como download.
             with etapa_registrada(logger, "PREFEITURA_SALVAR_DOWNLOAD", **contexto_log):
@@ -1647,6 +1746,10 @@ def baixar_nf_prefeitura(
                 pagina_resultado.wait_for_timeout(1_000)
         raise RuntimeError(f"A NFS-e {numero_nota} não foi salva como PDF: {ultimo_erro}")
     finally:
+        try:
+            contexto.unroute(padrao_prefeitura, interceptar_prefeitura)
+        except Exception:
+            pass
         for emissor, evento, funcao in (
             (contexto, "response", registrar_resposta),
             (contexto, "page", registrar_pagina),
@@ -1701,7 +1804,14 @@ def baixar_notas_codigo(
         }
         nome_final = f"{nome_seguro(credencial.contrato)}_NFS_{nome_seguro(numero)}_{nome_seguro(codigo)}.pdf"
         destino_final = pasta_codigo / nome_final
-        if destino_final.exists() and destino_final.stat().st_size > 0:
+        if destino_final.exists() and pdf_gerado_pelo_navegador(destino_final):
+            logger.warning(
+                "NFS-e %s do código %s: arquivo existente foi gerado pela impressão da página; "
+                "baixando o PDF original para substituí-lo.",
+                numero,
+                codigo,
+            )
+        elif destino_final.exists() and destino_final.stat().st_size > 0:
             registro["STATUS_DOWNLOAD"] = "JA_EXISTENTE"
             registro["ARQUIVO"] = destino_final.name
             ignorados += 1
@@ -1718,7 +1828,9 @@ def baixar_notas_codigo(
                 pasta_codigo,
                 logger,
             )
-            caminho, nome_final_existente = renomear_arquivo_baixado(caminho, nome_final, logger)
+            caminho, nome_final_existente = renomear_arquivo_baixado(
+                caminho, nome_final, logger, substituir_gerado_pelo_navegador=True
+            )
             existente = existente or nome_final_existente
             registro["STATUS_DOWNLOAD"] = "JA_EXISTENTE" if existente else "BAIXADO"
             registro["ARQUIVO"] = caminho.name
