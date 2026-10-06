@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Gravador de Portais Playwright — v1.2 — Python 3.10+ / Windows.
+"""Gravador de Portais Playwright — v1.3 — Python 3.10+ / Windows.
 
 INSTALAÇÃO (Prompt de Comando):
     py -m pip install playwright
@@ -63,7 +63,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit
 import uuid
 
-VERSION = '1.2'
+VERSION = '1.3'
 PDF_LIMIT = 50 * 1024 * 1024
 ZIP_MAX_BYTES = 256 * 1024 * 1024
 ZIP_MAX_ENTRIES = 10000
@@ -177,8 +177,11 @@ function flushOne(el) {
 }
 window.__flushPortal = () => { for (const el of dirty) flushOne(el); };
 window.__setPortalRecording = state => {
- if (!state) window.__flushPortal();
- enabled = !!state; dirty.clear(); valuesReset(); pendingTab = null; lastPointer = null; activation = null; labelClick = null;
+ state = !!state;
+ // Grava valores pendentes antes de qualquer mudança; repetir o estado atual não descarta nada.
+ if (enabled) window.__flushPortal();
+ if (state === enabled) return;
+ enabled = state; dirty.clear(); valuesReset(); pendingTab = null; lastPointer = null; activation = null; labelClick = null;
 };
 function valuesReset() { lastFocus = null; values = new WeakMap(); }
 window.__recordPortal({kind:'recorder_ready'}).then(state => {enabled = !!state;}).catch(() => {});
@@ -376,7 +379,8 @@ def inspect_file(path):
 
 def export_session(folder):
     events, invalid = [], 0
-    with (folder / 'eventos.jsonl').open(encoding='utf-8') as f:
+    # errors='replace': interrupção pode truncar um caractere UTF-8 na última linha.
+    with (folder / 'eventos.jsonl').open(encoding='utf-8', errors='replace') as f:
         for line in f:
             if not line.strip():
                 continue
@@ -419,9 +423,10 @@ def export_session(folder):
     def md(value):
         return str(value).replace('|', r'\|').replace('\n', ' ')[:900]
     def element_name(el):
-        if not el:
+        if not isinstance(el, dict):
             return '(sem elemento)'
-        return el.get('label') or el.get('text') or next((c['value'] for c in el.get('candidates',[]) if c['kind']=='css'), el.get('tag',''))
+        candidates = [c for c in el.get('candidates') or [] if isinstance(c, dict)]
+        return str(el.get('label') or el.get('text') or next((c.get('value','') for c in candidates if c.get('kind')=='css'), el.get('tag','')))
     lines = ['# Gravação de portal', '', f'Eventos: {len(events)}. Linhas incompletas ignoradas: {invalid}.', '',
              'Arquivos salvos: %s; tentativas com falha: %s; incompletas: %s.' % tuple(sum(r['status']==v for r in rows) for v in ('SALVO','FALHOU','INCOMPLETO')),
              'Contagens representam operações; arquivos idênticos podem compartilhar uma cópia.',
@@ -440,9 +445,10 @@ def export_session(folder):
             detail = element_name(e.get('to'))
         elif e.get('element'):
             detail = element_name(e['element'])
-            ancestors = e['element'].get('context',{}).get('ancestors',[])
+            context = e['element'].get('context') if isinstance(e['element'], dict) else None
+            ancestors = [a for a in (context or {}).get('ancestors') or [] if isinstance(a, dict)] if isinstance(context, dict) else []
             if ancestors:
-                detail += ' | contexto: ' + ancestors[min(1,len(ancestors)-1)].get('text','')
+                detail += ' | contexto: ' + str(ancestors[min(1,len(ancestors)-1)].get('text',''))
         if e.get('replay_hint'):
             detail += ' [' + e['replay_hint'] + ']'
         if e.get('error'):
@@ -484,6 +490,8 @@ class Recorder:
         self.updates.put(('log', message))
 
     def event(self, kind, **data):
+        if self.stream.closed:
+            return self.seq  # callback tardio após o encerramento da sessão
         self.seq += 1
         event = {'id': self.seq, 'time': datetime.now(timezone.utc).isoformat(),
                  'kind': kind, 'stage': self.stage, **data}
@@ -518,12 +526,18 @@ class Recorder:
             self.inform('Falha em tarefa auxiliar; consulte os eventos.')
 
     async def binding(self, source, payload):
+        if not isinstance(payload, dict):
+            return False
         if payload.get('kind') == 'recorder_ready':
             return self.active
         if not self.active:
             return False
         page = source['page']
-        kind = payload.pop('kind', 'unknown')
+        kind = str(payload.pop('kind', 'unknown'))[:64]
+        # O portal também enxerga __recordPortal: chaves reservadas não sobrescrevem os metadados.
+        for key in ('id', 'time', 'stage', 'page', 'frames'):
+            if key in payload:
+                payload['portal_' + key] = payload.pop(key)
         number = self.event(kind, page=self.page_id(page), frames=self.frame_info(source['frame']), **payload)
         local_id = str(payload.get('document_id','')) + ':' + str(payload.get('local_seq',''))
         self.event_ids[local_id] = number
@@ -542,6 +556,11 @@ class Recorder:
         return True
 
     async def set_active(self, active):
+        if active == self.active:
+            # Clique repetido não reinicia o estado das páginas nem duplica eventos.
+            await self.flush()
+            self.inform('Gravação já está ' + ('ativa.' if active else 'pausada.'))
+            return
         # Flush antes de desligar; Python continua aceitando o último valor.
         if not active:
             await self.flush()
@@ -733,7 +752,7 @@ class Recorder:
             path = self.folder / 'capturas' / (self.page_id(page) + '_' + uuid.uuid4().hex[:8] + '.png')
             try:
                 await page.screenshot(path=str(path), full_page=False, timeout=10000,
-                                      mask=[page.locator('input[type="password"]')])
+                                      mask=[page.locator('input[type="password"], input[autocomplete="one-time-code"]')])
                 self.event('screenshot', page=self.page_id(page), file=str(path.relative_to(self.folder)))
             except Exception as exc:
                 self.event('screenshot_failed', page=self.page_id(page), error=clean_error(exc), error_type=type(exc).__name__)
@@ -799,7 +818,8 @@ class Recorder:
                     elif command == 'screenshot':
                         await self.screenshot()
                 if browser.is_connected():
-                    await self.set_active(False)
+                    if self.active:
+                        await self.set_active(False)
                     self.inform('Finalizando; aguardando downloads pendentes (até 5 minutos)...')
                     if self.tasks:
                         done, pending = await asyncio.wait(list(self.tasks), timeout=305)
