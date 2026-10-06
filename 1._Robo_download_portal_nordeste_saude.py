@@ -58,6 +58,15 @@ XPATH_TABELA_BOLETOS = "/html/body/main/div[3]/div[3]/div[1]/table"
 XPATH_VERIFICAR_PREFEITURA = "/html/body/form/div[2]/center/table[2]/tbody/tr/td[3]/table/tbody/tr/td[2]/a"
 XPATH_BOLETAS_MODAL_CSV = "/html/body/main/div[3]/div[3]/div[2]/div/div/div[2]/div/div/div/div[1]/button/i"
 XPATH_BOLETAS_MODAL_PDF = "/html/body/main/div[3]/div[3]/div[2]/div/div/div[2]/div/div/div/div[2]/button/i"
+# Seletores obtidos na gravação do portal (06/10/2026). O modal tem id próprio; os XPaths
+# absolutos acima não correspondem ao layout atual e ficam apenas como alternativa.
+CSS_MODAL_BOLETAS = "#rel-bol-existentes-modal"
+CSS_BOLETAS_MODAL_CSV = (
+    f"{CSS_MODAL_BOLETAS} > div > div > div:nth-of-type(2) > div > div > div > div:nth-of-type(1) > button"
+)
+CSS_BOLETAS_MODAL_PDF = (
+    f"{CSS_MODAL_BOLETAS} > div > div > div:nth-of-type(2) > div > div > div > div:nth-of-type(2) > button"
+)
 
 TIMEOUT_PADRAO_MS = 30_000
 TIMEOUT_CARREGAMENTO_MS = 60_000
@@ -1752,6 +1761,16 @@ def baixar_relatorio_icone(
     raise RuntimeError(f"Código {codigo}, relatório '{descricao}': {ultimo_erro}")
 
 
+def botao_modal_boletas(page: Page, css_gravado: str, xpath_antigo: str, posicao: int) -> Locator:
+    """Botão CSV (posicao 0) ou PDF (posicao 1) do modal Relação das Boletas Existentes."""
+    return (
+        page.locator(css_gravado)
+        .or_(page.locator(f"{CSS_MODAL_BOLETAS} .modal-body button").nth(posicao))
+        .or_(page.locator(f"xpath={xpath_antigo}"))
+        .first
+    )
+
+
 def baixar_boletas_modal(
     page: Page,
     linha: Locator,
@@ -1770,20 +1789,20 @@ def baixar_boletas_modal(
     arquivos = (
         (
             "CSV",
-            XPATH_BOLETAS_MODAL_CSV,
+            (CSS_BOLETAS_MODAL_CSV, XPATH_BOLETAS_MODAL_CSV, 0),
             pasta_codigo
             / f"{nome_seguro(contrato)}_Relacao_das_Boletas_Existentes_{nome_seguro(codigo)}.csv",
         ),
         (
             "PDF",
-            XPATH_BOLETAS_MODAL_PDF,
+            (CSS_BOLETAS_MODAL_PDF, XPATH_BOLETAS_MODAL_PDF, 1),
             pasta_codigo
             / f"{nome_seguro(contrato)}_Relacao_das_Boletas_Existentes_{nome_seguro(codigo)}.pdf",
         ),
     )
     baixados = ignorados = indisponiveis = falhas = 0
     try:
-        for formato, xpath_botao, destino in arquivos:
+        for formato, seletores_botao, destino in arquivos:
             if destino.exists() and destino.stat().st_size > 0:
                 ignorados += 1
                 logger.info("Código %s: Boletas %s já existente: %s", codigo, formato, destino.name)
@@ -1793,7 +1812,7 @@ def baixar_boletas_modal(
             concluido = False
             for tentativa in range(1, MAXIMO_TENTATIVAS_DOWNLOAD + 1):
                 try:
-                    botao = page.locator(f"xpath={xpath_botao}")
+                    botao = botao_modal_boletas(page, *seletores_botao)
                     if not botao.is_visible(timeout=1_000):
                         with etapa_registrada(
                             logger,
