@@ -65,6 +65,14 @@ Configurações opcionais (.env ou variáveis de ambiente):
     WORKERS_PARALELOS=1                  janelas do navegador trabalhando ao mesmo tempo
     INTERVALO_INICIO_WORKERS_SEG=5       intervalo entre a abertura de cada janela
     PULAR_CONTRATO_CONCLUIDO=1           0 = sempre reabre contratos já concluídos
+    TIPOS_FATURA=MENSALIDADE,COPARTICIPACAO  tipos de fatura a processar
+    USAR_INTERFACE=1                     0 = não mostra a tela de seleção (usa o .env)
+
+Tela de seleção (tkinter):
+    Ao iniciar, uma janela pergunta o tipo de fatura (Mensalidade/Coparticipação),
+    os arquivos (CSV/TXT/PDF), Boleto e NF, janelas em paralelo e a planilha.
+    A escolha vale só para a execução (o .env não é alterado) e fica salva em
+    Logs/preferencias_interface_analiticos.json para vir marcada na próxima vez.
 """
 
 import csv
@@ -266,6 +274,25 @@ class HapvidaNDIAnaliticosAutomation:
         documentos.extend(f"ANALITICO_{formato}" for formato in self.formatos_analiticos)
         self.DOCUMENTOS_PERMITIDOS = tuple(documentos)
 
+        # --- INÍCIO INSERÇÃO FILTRO POR TIPO DE FATURA ---
+        # TIPOS_FATURA=MENSALIDADE,COPARTICIPACAO (padrão: os dois). Com os dois
+        # selecionados o robô se comporta exatamente como antes (sem filtro).
+        mapa_tipos = {
+            "MENSALIDADE": self.TIPO_MENSALIDADE,
+            "COPARTICIPACAO": self.TIPO_CARNET,
+            "COPARTICIPAÇÃO": self.TIPO_CARNET,
+        }
+        self.tipos_fatura_selecionados = []
+        for nome_tipo in re.split(r"[,;\s]+", os.getenv("TIPOS_FATURA", "MENSALIDADE,COPARTICIPACAO").upper()):
+            tipo = mapa_tipos.get(nome_tipo.strip())
+            if tipo and tipo not in self.tipos_fatura_selecionados:
+                self.tipos_fatura_selecionados.append(tipo)
+        if not self.tipos_fatura_selecionados:
+            self.tipos_fatura_selecionados = list(self.PRIORIDADE_TIPOS)
+        self.filtrar_tipos_fatura = set(self.tipos_fatura_selecionados) != set(self.PRIORIDADE_TIPOS)
+        self.sem_fatura_do_tipo_atual = False
+        # --- FIM INSERÇÃO FILTRO POR TIPO DE FATURA ---
+
         self.extrair_zip_ativo = os.getenv("EXTRAIR_ZIP_ANALITICO", "1").strip().lower() in valores_verdadeiros
         self.timeout_download_analitico = int(os.getenv("TIMEOUT_DOWNLOAD_ANALITICO_MS", "60000"))
         self.timeout_botao_analitico_total = int(os.getenv("TIMEOUT_BOTAO_ANALITICO_TOTAL_MS", "8000"))
@@ -400,6 +427,7 @@ class HapvidaNDIAnaliticosAutomation:
             "ANALITICO_PDF": 0,
             "arquivos_extraidos_zip": 0,
             "contratos_pulados_concluidos": 0,
+            "contratos_sem_fatura_do_tipo": 0,
         }
         self.inicializar_controle_txt()
         self.documentos_ok_controle = self.carregar_documentos_ok_controle()
@@ -786,6 +814,13 @@ class HapvidaNDIAnaliticosAutomation:
         contrato volta a ser processado.
         """
         escopo = ",".join(sorted(self.DOCUMENTOS_PERMITIDOS))
+        if self.filtrar_tipos_fatura:
+            # Só Mensalidade ou só Coparticipação: o contrato concluído com um
+            # tipo não é pulado quando o outro tipo for pedido depois. Com os
+            # dois tipos a chave é a mesma da versão anterior.
+            escopo += "+" + ",".join(
+                sorted(self.obter_sufixo_tipo_fatura(tipo) for tipo in self.tipos_fatura_selecionados)
+            )
         return (
             self.limpar_campo_txt(contrato).upper(),
             self.limpar_campo_txt(vencimento),
@@ -1077,6 +1112,10 @@ class HapvidaNDIAnaliticosAutomation:
         if self.baixar_boleto_nf:
             escopo += " + BOLETOS E NOTAS FISCAIS"
         print(f"\nMODO DE DOWNLOAD: {escopo}")
+        print(
+            "TIPOS DE FATURA: "
+            + ", ".join(self.obter_sufixo_tipo_fatura(t) for t in self.tipos_fatura_selecionados)
+        )
         print("\n=======================================================")
         print("                  RESUMO FINAL")
         print("=======================================================")
@@ -1085,6 +1124,7 @@ class HapvidaNDIAnaliticosAutomation:
         print(f"Contratos com sucesso parcial/pendência: {self.resumo_execucao['contratos_pendencia']}")
         print(f"Contratos com erro: {self.resumo_execucao['contratos_erro']}")
         print(f"Contratos pulados (já concluídos antes): {self.resumo_execucao.get('contratos_pulados_concluidos', 0)}")
+        print(f"Contratos sem fatura do tipo selecionado: {self.resumo_execucao.get('contratos_sem_fatura_do_tipo', 0)}")
         print(f"Faturas processadas: {self.resumo_execucao['faturas_processadas']}")
         print(f"Arquivos baixados nesta execução: {self.resumo_execucao['arquivos_baixados']}")
         print(f"Arquivos pulados por duplicidade: {self.resumo_execucao['arquivos_pulados']}")
@@ -6040,10 +6080,33 @@ class HapvidaNDIAnaliticosAutomation:
     # ----------------------------------------------------------------------
     # Processamento das faturas
     # ----------------------------------------------------------------------
+    # --- INÍCIO INSERÇÃO FILTRO POR TIPO DE FATURA ---
+    def filtrar_ocorrencias_por_tipo(self, ocorrencias, tipos_ignorados):
+        """Mantém só os tipos selecionados; anota os tipos descartados."""
+        if not self.filtrar_tipos_fatura:
+            return list(ocorrencias)
+        selecionadas = []
+        for ocorrencia in ocorrencias:
+            if ocorrencia.get("tipo_fatura") in self.tipos_fatura_selecionados:
+                selecionadas.append(ocorrencia)
+            else:
+                tipos_ignorados.add(str(ocorrencia.get("tipo_fatura")))
+        return selecionadas
+    # --- FIM INSERÇÃO FILTRO POR TIPO DE FATURA ---
+
     def processar_faturas_do_vencimento(self, vencimento_alvo):
         print(f"\nProcurando faturas para o vencimento: {vencimento_alvo}...")
         ocorrencias = []
         self.linhas_extrato_vistas = []
+        # --- INÍCIO INSERÇÃO FILTRO POR TIPO DE FATURA ---
+        self.sem_fatura_do_tipo_atual = False
+        tipos_ignorados = set()
+        if self.filtrar_tipos_fatura:
+            print(
+                "Tipos de fatura selecionados: "
+                + ", ".join(self.obter_sufixo_tipo_fatura(t) for t in self.tipos_fatura_selecionados)
+            )
+        # --- FIM INSERÇÃO FILTRO POR TIPO DE FATURA ---
         try:
             self.url_extrato_atual = str(self.page.url or "")
         except Exception:
@@ -6051,7 +6114,12 @@ class HapvidaNDIAnaliticosAutomation:
 
         print("-> Verificando aba 'Em Aberto'...")
         self.navegar_para_aba_e_pagina("ABERTO", 1)
-        ocorrencias.extend(self.pesquisar_ocorrencias_na_tela(vencimento_alvo, "ABERTO", 1))
+        ocorrencias.extend(
+            self.filtrar_ocorrencias_por_tipo(
+                self.pesquisar_ocorrencias_na_tela(vencimento_alvo, "ABERTO", 1),
+                tipos_ignorados,
+            )
+        )
 
         if not ocorrencias:
             print("-> Fatura não encontrada em 'Em Aberto'. Verificando aba 'Histórico'...")
@@ -6060,11 +6128,39 @@ class HapvidaNDIAnaliticosAutomation:
                 pagina_disponivel = self.navegar_para_aba_e_pagina("HISTORICO", pagina)
                 if not pagina_disponivel:
                     break
-                encontradas = self.pesquisar_ocorrencias_na_tela(vencimento_alvo, "HISTORICO", pagina)
+                encontradas = self.filtrar_ocorrencias_por_tipo(
+                    self.pesquisar_ocorrencias_na_tela(vencimento_alvo, "HISTORICO", pagina),
+                    tipos_ignorados,
+                )
                 if encontradas:
                     ocorrencias.extend(encontradas)
                     break
             # --- FIM INSERÇÃO OTIMIZAÇÃO DE TEMPO / PARADA ANTECIPADA DO HISTÓRICO ---
+
+        # --- INÍCIO INSERÇÃO FILTRO POR TIPO DE FATURA ---
+        if not ocorrencias and tipos_ignorados:
+            # O vencimento existe, mas só com faturas de tipos não selecionados:
+            # não é falha do robô, então não gera screenshot nem log de erro.
+            selecionados = ", ".join(self.obter_sufixo_tipo_fatura(t) for t in self.tipos_fatura_selecionados)
+            ignorados = ", ".join(sorted(tipos_ignorados))
+            mensagem = (
+                f"Nenhuma fatura do tipo selecionado ({selecionados}) para o vencimento "
+                f"{vencimento_alvo}. Encontrada(s) e ignorada(s): {ignorados}."
+            )
+            print(mensagem)
+            self.sem_fatura_do_tipo_atual = True
+            self.evidencias_contrato_atual.append({
+                "contrato": str(self.contrato_atual or ""),
+                "vencimento": str(vencimento_alvo or ""),
+                "tipo_fatura": "SEM_FATURA_DO_TIPO_SELECIONADO",
+                "status_docs": {},
+                "status_geral": "SEM_FATURA_DO_TIPO",
+                "mensagem": self.limpar_campo_txt(mensagem),
+                "caminhos": {},
+                "data_hora": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+            })
+            return False
+        # --- FIM INSERÇÃO FILTRO POR TIPO DE FATURA ---
 
         if not ocorrencias:
             print("Nenhuma fatura encontrada para esta data em nenhuma aba.")
@@ -6383,11 +6479,18 @@ class HapvidaNDIAnaliticosAutomation:
                     elif resultado_contrato == "PARCIAL":
                         status = "Pendência - Download parcial"
                         self.resumo_execucao["contratos_pendencia"] += 1
+                    # --- INÍCIO INSERÇÃO FILTRO POR TIPO DE FATURA ---
+                    elif self.sem_fatura_do_tipo_atual:
+                        status = "Sem fatura do tipo selecionado"
+                        self.resumo_execucao["contratos_sem_fatura_do_tipo"] += 1
+                    # --- FIM INSERÇÃO FILTRO POR TIPO DE FATURA ---
                     else:
                         status = "Pendência - Nenhum documento concluído"
                         self.resumo_execucao["contratos_pendencia"] += 1
 
                     detalhes = self.montar_detalhes_resultado_contrato()
+                    if self.sem_fatura_do_tipo_atual and resultado_contrato == "SEM_DOWNLOAD":
+                        detalhes = "Vencimento sem fatura do tipo selecionado"
                     df_contratos.at[index, "STATUS"] = status
                     df_contratos.at[index, "DETALHES_DOWNLOAD"] = detalhes
                     df_contratos.at[index, "ULTIMA_EXECUCAO"] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
@@ -6684,11 +6787,18 @@ class HapvidaNDIAnaliticosAutomation:
                     elif resultado_contrato == "PARCIAL":
                         status = "Pendência - Download parcial"
                         self.resumo_execucao["contratos_pendencia"] += 1
+                    # --- INÍCIO INSERÇÃO FILTRO POR TIPO DE FATURA ---
+                    elif self.sem_fatura_do_tipo_atual:
+                        status = "Sem fatura do tipo selecionado"
+                        self.resumo_execucao["contratos_sem_fatura_do_tipo"] += 1
+                    # --- FIM INSERÇÃO FILTRO POR TIPO DE FATURA ---
                     else:
                         status = "Pendência - Nenhum documento concluído"
                         self.resumo_execucao["contratos_pendencia"] += 1
 
                     detalhes = self.montar_detalhes_resultado_contrato()
+                    if self.sem_fatura_do_tipo_atual and resultado_contrato == "SEM_DOWNLOAD":
+                        detalhes = "Vencimento sem fatura do tipo selecionado"
                     df_contratos.at[index, "STATUS"] = status
                     df_contratos.at[index, "DETALHES_DOWNLOAD"] = detalhes
                     df_contratos.at[index, "ULTIMA_EXECUCAO"] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
@@ -6768,6 +6878,259 @@ class HapvidaNDIAnaliticosAutomation:
 
 # --- FIM INSERÇÃO PLAYWRIGHT (CLASSE MANTENDO FLUXO ORIGINAL) ---
 
+# --- INÍCIO INSERÇÃO INTERFACE TKINTER (SELEÇÃO DO QUE BAIXAR) ---
+def ler_preferencias_interface(caminho):
+    try:
+        with open(caminho, "r", encoding="utf-8") as arquivo:
+            dados = json.load(arquivo)
+        return dados if isinstance(dados, dict) else {}
+    except Exception:
+        return {}
+
+
+def salvar_preferencias_interface(caminho, escolha):
+    try:
+        Path(caminho).parent.mkdir(parents=True, exist_ok=True)
+        with open(caminho, "w", encoding="utf-8") as arquivo:
+            json.dump(escolha, arquivo, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[AVISO] Não foi possível salvar as preferências da tela: {e}")
+
+
+def valores_iniciais_interface(arquivo_excel_padrao, caminho_preferencias):
+    """Última escolha salva na tela; sem ela, os valores do .env / padrão."""
+    valores_verdadeiros = {"1", "true", "sim", "s"}
+    tipos_env = {
+        t.strip()
+        for t in re.split(r"[,;\s]+", os.getenv("TIPOS_FATURA", "MENSALIDADE,COPARTICIPACAO").upper())
+        if t.strip()
+    }
+    formatos_env = {
+        f.strip()
+        for f in re.split(r"[,;\s]+", os.getenv("FORMATOS_ANALITICOS", "CSV,TXT,PDF").upper())
+        if f.strip()
+    }
+    try:
+        workers_env = int(os.getenv("WORKERS_PARALELOS", "1"))
+    except ValueError:
+        workers_env = 1
+    valores = {
+        "tipos": [t for t in ("MENSALIDADE", "COPARTICIPACAO") if t in tipos_env or
+                  (t == "COPARTICIPACAO" and "COPARTICIPAÇÃO" in tipos_env)],
+        "formatos": [f for f in ("CSV", "TXT", "PDF") if f in formatos_env],
+        "boleto_nf": os.getenv("BAIXAR_BOLETO_NF", "0").strip().lower() in valores_verdadeiros,
+        "workers": workers_env,
+        "planilha": str(arquivo_excel_padrao),
+    }
+    salvas = ler_preferencias_interface(caminho_preferencias)
+    for chave in valores:
+        if chave in salvas:
+            valores[chave] = salvas[chave]
+    # Planilha salva que não existe mais (movida/renomeada): volta para a padrão.
+    if not Path(str(valores.get("planilha") or "")).exists():
+        valores["planilha"] = str(arquivo_excel_padrao)
+    try:
+        valores["workers"] = min(4, max(1, int(valores.get("workers") or 1)))
+    except (TypeError, ValueError):
+        valores["workers"] = 1
+    return valores
+
+
+def abrir_interface_configuracao(arquivo_excel_padrao, caminho_preferencias):
+    """
+    Tela de seleção exibida antes do robô. Retorna:
+    - dict com as escolhas, ao clicar em Iniciar;
+    - None, se a tela for fechada ou cancelada;
+    - "SEM_TK", se o tkinter não estiver disponível (o robô segue com o .env).
+    A tela só coleta as escolhas: depois de Iniciar ela fecha e o robô roda
+    no console, como antes.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import filedialog, ttk
+    except Exception:
+        return "SEM_TK"
+
+    valores = valores_iniciais_interface(arquivo_excel_padrao, caminho_preferencias)
+    resultado = {"escolha": None}
+
+    try:
+        janela = tk.Tk()
+    except Exception:
+        # Sem ambiente gráfico (ex.: sessão sem área de trabalho).
+        return "SEM_TK"
+
+    janela.title("Robô NDI - Relatórios Analíticos")
+    janela.resizable(False, False)
+
+    estilo = ttk.Style(janela)
+    try:
+        if "vista" in estilo.theme_names():
+            estilo.theme_use("vista")
+    except Exception:
+        pass
+    estilo.configure("Titulo.TLabel", font=("Segoe UI", 12, "bold"))
+    estilo.configure("Aviso.TLabel", foreground="#B00020")
+
+    quadro = ttk.Frame(janela, padding=16)
+    quadro.grid(row=0, column=0, sticky="nsew")
+
+    ttk.Label(quadro, text="O que deseja baixar?", style="Titulo.TLabel").grid(
+        row=0, column=0, columnspan=2, sticky="w", pady=(0, 10)
+    )
+
+    var_mensalidade = tk.BooleanVar(value="MENSALIDADE" in valores["tipos"])
+    var_coparticipacao = tk.BooleanVar(value="COPARTICIPACAO" in valores["tipos"])
+    grupo_tipos = ttk.LabelFrame(quadro, text="Tipo de fatura", padding=10)
+    grupo_tipos.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+    ttk.Checkbutton(grupo_tipos, text="Mensalidade", variable=var_mensalidade).grid(row=0, column=0, sticky="w")
+    ttk.Checkbutton(grupo_tipos, text="Coparticipação", variable=var_coparticipacao).grid(row=1, column=0, sticky="w")
+
+    variaveis_formato = {}
+    grupo_formatos = ttk.LabelFrame(quadro, text="Arquivos", padding=10)
+    grupo_formatos.grid(row=1, column=1, sticky="nsew")
+    for linha, formato in enumerate(("CSV", "TXT", "PDF")):
+        variaveis_formato[formato] = tk.BooleanVar(value=formato in valores["formatos"])
+        ttk.Checkbutton(grupo_formatos, text=formato, variable=variaveis_formato[formato]).grid(
+            row=linha, column=0, sticky="w"
+        )
+
+    grupo_opcoes = ttk.LabelFrame(quadro, text="Opções", padding=10)
+    grupo_opcoes.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+    var_boleto_nf = tk.BooleanVar(value=bool(valores["boleto_nf"]))
+    ttk.Checkbutton(grupo_opcoes, text="Baixar também Boleto e Nota Fiscal", variable=var_boleto_nf).grid(
+        row=0, column=0, columnspan=3, sticky="w"
+    )
+    ttk.Label(grupo_opcoes, text="Janelas em paralelo:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+    var_workers = tk.StringVar(value=str(valores["workers"]))
+    ttk.Spinbox(grupo_opcoes, from_=1, to=4, width=4, textvariable=var_workers, state="readonly").grid(
+        row=1, column=1, sticky="w", padx=(6, 0), pady=(8, 0)
+    )
+    ttk.Label(grupo_opcoes, text="(1 = uma janela, como antes)").grid(
+        row=1, column=2, sticky="w", padx=(6, 0), pady=(8, 0)
+    )
+
+    grupo_planilha = ttk.LabelFrame(quadro, text="Planilha de contratos", padding=10)
+    grupo_planilha.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+    var_planilha = tk.StringVar(value=valores["planilha"])
+    ttk.Entry(grupo_planilha, textvariable=var_planilha, width=52).grid(row=0, column=0, sticky="ew")
+
+    def procurar_planilha():
+        atual = Path(var_planilha.get() or str(arquivo_excel_padrao))
+        caminho = filedialog.askopenfilename(
+            parent=janela,
+            title="Selecione a planilha de contratos",
+            initialdir=str(atual.parent if atual.parent.exists() else Path(arquivo_excel_padrao).parent),
+            filetypes=[("Planilhas Excel", "*.xlsx *.xlsm *.xls"), ("Todos os arquivos", "*.*")],
+        )
+        if caminho:
+            var_planilha.set(caminho)
+
+    ttk.Button(grupo_planilha, text="Procurar...", command=procurar_planilha).grid(row=0, column=1, padx=(6, 0))
+
+    var_aviso = tk.StringVar(value="")
+    ttk.Label(quadro, textvariable=var_aviso, style="Aviso.TLabel").grid(
+        row=4, column=0, columnspan=2, sticky="w", pady=(10, 0)
+    )
+
+    botoes = ttk.Frame(quadro)
+    botoes.grid(row=5, column=0, columnspan=2, sticky="e", pady=(10, 0))
+    botao_cancelar = ttk.Button(botoes, text="Cancelar")
+    botao_iniciar = ttk.Button(botoes, text="Iniciar")
+    botao_cancelar.grid(row=0, column=0, padx=(0, 6))
+    botao_iniciar.grid(row=0, column=1)
+
+    def montar_escolha():
+        tipos = []
+        if var_mensalidade.get():
+            tipos.append("MENSALIDADE")
+        if var_coparticipacao.get():
+            tipos.append("COPARTICIPACAO")
+        return {
+            "tipos": tipos,
+            "formatos": [f for f in ("CSV", "TXT", "PDF") if variaveis_formato[f].get()],
+            "boleto_nf": bool(var_boleto_nf.get()),
+            "workers": min(4, max(1, int(var_workers.get() or 1))),
+            "planilha": var_planilha.get().strip(),
+        }
+
+    def validar(*_):
+        escolha = montar_escolha()
+        if not escolha["tipos"]:
+            mensagem = "Marque pelo menos um tipo de fatura."
+        elif not escolha["formatos"]:
+            mensagem = "Marque pelo menos um tipo de arquivo."
+        elif not escolha["planilha"] or not Path(escolha["planilha"]).is_file():
+            mensagem = "Planilha não encontrada."
+        else:
+            mensagem = ""
+        var_aviso.set(mensagem)
+        botao_iniciar.state(["disabled"] if mensagem else ["!disabled"])
+
+    tarefas_agendadas = []
+
+    def fechar_janela():
+        # Cancela tarefas pendentes (ex.: retirar o "sempre no topo") antes de
+        # destruir a janela, para não executarem sobre uma janela que já fechou.
+        for tarefa in tarefas_agendadas:
+            try:
+                janela.after_cancel(tarefa)
+            except Exception:
+                pass
+        janela.destroy()
+
+    def iniciar():
+        validar()
+        if botao_iniciar.instate(["disabled"]):
+            return
+        resultado["escolha"] = montar_escolha()
+        fechar_janela()
+
+    def cancelar():
+        resultado["escolha"] = None
+        fechar_janela()
+
+    botao_iniciar.configure(command=iniciar)
+    botao_cancelar.configure(command=cancelar)
+    janela.protocol("WM_DELETE_WINDOW", cancelar)
+    janela.bind("<Return>", lambda _evento: iniciar())
+    janela.bind("<Escape>", lambda _evento: cancelar())
+    for variavel in [var_mensalidade, var_coparticipacao, var_planilha, *variaveis_formato.values()]:
+        variavel.trace_add("write", validar)
+    validar()
+
+    # Centraliza e traz para a frente (o console costuma ficar por cima).
+    janela.update_idletasks()
+    largura, altura = janela.winfo_width(), janela.winfo_height()
+    x = (janela.winfo_screenwidth() - largura) // 2
+    y = (janela.winfo_screenheight() - altura) // 3
+    janela.geometry(f"+{max(0, x)}+{max(0, y)}")
+    janela.attributes("-topmost", True)
+    tarefas_agendadas.append(janela.after(400, lambda: janela.attributes("-topmost", False)))
+    janela.focus_force()
+
+    janela.mainloop()
+
+    escolha = resultado["escolha"]
+    if escolha:
+        salvar_preferencias_interface(caminho_preferencias, escolha)
+    return escolha
+
+
+def aplicar_escolha_interface(escolha):
+    """
+    Converte a escolha da tela nas mesmas variáveis que o .env usa. Elas valem
+    só para esta execução (não alteram o arquivo .env) e são lidas no __init__
+    de cada instância, inclusive das janelas paralelas.
+    """
+    os.environ["TIPOS_FATURA"] = ",".join(escolha["tipos"])
+    os.environ["FORMATOS_ANALITICOS"] = ",".join(escolha["formatos"])
+    os.environ["BAIXAR_BOLETO_NF"] = "1" if escolha["boleto_nf"] else "0"
+    os.environ["WORKERS_PARALELOS"] = str(escolha["workers"])
+    return Path(escolha["planilha"])
+# --- FIM INSERÇÃO INTERFACE TKINTER (SELEÇÃO DO QUE BAIXAR) ---
+
+
 if __name__ == "__main__":
     print("\n=======================================================")
     print("         ROBO DE DOWNLOADS NDI - HAPVIDA")
@@ -6777,6 +7140,29 @@ if __name__ == "__main__":
     diretorio_atual = Path(__file__).resolve().parent
     nome_arquivo = "NDI_CONTRATOS_DOWNLOAD.xlsx"
     arquivo_excel = diretorio_atual / nome_arquivo
+
+    # --- INÍCIO INSERÇÃO INTERFACE TKINTER (SELEÇÃO DO QUE BAIXAR) ---
+    # USAR_INTERFACE=0 pula a tela e usa o .env (ex.: Agendador de Tarefas).
+    if os.getenv("USAR_INTERFACE", "1").strip().lower() in {"1", "true", "sim", "s"}:
+        escolha = abrir_interface_configuracao(
+            arquivo_excel,
+            diretorio_atual / "Logs" / "preferencias_interface_analiticos.json",
+        )
+        if escolha == "SEM_TK":
+            print("[AVISO] Tela de seleção indisponível (tkinter/ambiente gráfico). Usando as configurações do .env.")
+        elif escolha is None:
+            print("Execução cancelada na tela de seleção. Nenhum contrato foi processado.")
+            os.system("pause")
+            raise SystemExit(0)
+        else:
+            arquivo_excel = aplicar_escolha_interface(escolha)
+            print(
+                "Seleção da tela: "
+                f"tipos={', '.join(escolha['tipos'])} | arquivos={', '.join(escolha['formatos'])} | "
+                f"boleto/NF={'sim' if escolha['boleto_nf'] else 'não'} | "
+                f"janelas={escolha['workers']} | planilha={arquivo_excel}"
+            )
+    # --- FIM INSERÇÃO INTERFACE TKINTER (SELEÇÃO DO QUE BAIXAR) ---
 
     automacao = HapvidaNDIAnaliticosAutomation(arquivo_excel)
     automacao.executar()
