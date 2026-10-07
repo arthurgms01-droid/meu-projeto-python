@@ -4,9 +4,13 @@ Conversor do "Demonstrativo Mensalidade por Pagador (Portal Web)" - Unimed
 de PDF para Excel (.xlsx) já formatado.
 
 Uso:
-    python pdf_unimed_para_excel.py                    -> abre janela para escolher PDF(s)
-    python pdf_unimed_para_excel.py arquivo.pdf        -> converte um arquivo
-    python pdf_unimed_para_excel.py C:/pasta/com/pdfs  -> converte todos os PDFs da pasta
+    Clique duplo no arquivo (ou: python pdf_unimed_para_excel.py)
+        -> abre a tela do programa (tkinter): selecione PDFs ou uma pasta e
+           clique em "CONVERTER PARA EXCEL".
+    Arrastar PDFs/pasta sobre o .py
+        -> abre a tela já com os arquivos na lista.
+    python pdf_unimed_para_excel.py --console arquivo.pdf C:/pasta/com/pdfs
+        -> converte direto no console, sem janela.
 
 O Excel é gerado na mesma pasta do PDF, com o mesmo nome e extensão .xlsx.
 
@@ -749,9 +753,9 @@ def gerar_excel(dados, caminho_saida, nome_arquivo_pdf):
 # ----------------------------------------------------------------------------
 # Fluxo principal
 # ----------------------------------------------------------------------------
-def converter_pdf(caminho_pdf):
-    print("=" * 60)
-    print(f"LENDO O ARQUIVO: {caminho_pdf}")
+def converter_pdf(caminho_pdf, log=print):
+    log("=" * 60)
+    log(f"LENDO O ARQUIVO: {caminho_pdf}")
     dados = extrair_dados_pdf(caminho_pdf)
 
     caminho_saida = os.path.splitext(caminho_pdf)[0] + ".xlsx"
@@ -760,28 +764,34 @@ def converter_pdf(caminho_pdf):
     except PermissionError:
         base = os.path.splitext(caminho_pdf)[0]
         caminho_saida = f"{base}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        print("  Aviso: o Excel original está aberto. Salvando com outro nome.")
+        log("  Aviso: o Excel original está aberto. Salvando com outro nome.")
         gerar_excel(dados, caminho_saida, os.path.basename(caminho_pdf))
 
     soma = sum(Decimal(str(r["vl_mensalidade"] or 0)) + Decimal(str(r["vl_outros"] or 0))
                for r in dados["beneficiarios"])
     bruto = dados["cabecalho"]["Vl. Bruto"]
-    print(f"  Páginas lidas.............: {dados['total_paginas']}")
-    print(f"  Beneficiários extraídos...: {len(dados['beneficiarios'])}")
-    print(f"  Famílias (totais no PDF)..: {len(dados['totais_familia'])}")
-    print(f"  Soma extraída.............: {moeda_br(soma)}")
+    confere = None
+    log(f"  Páginas lidas.............: {dados['total_paginas']}")
+    log(f"  Beneficiários extraídos...: {len(dados['beneficiarios'])}")
+    log(f"  Famílias (totais no PDF)..: {len(dados['totais_familia'])}")
+    log(f"  Soma extraída.............: {moeda_br(soma)}")
     if bruto is not None:
         diferenca = soma - Decimal(str(bruto))
-        status = "OK" if abs(diferenca) < Decimal("0.01") else f"DIFERENÇA DE {moeda_br(diferenca)}"
-        print(f"  Vl. Bruto do cabeçalho....: {moeda_br(bruto)}  -> {status}")
+        confere = abs(diferenca) < Decimal("0.01")
+        status = "OK" if confere else f"DIFERENÇA DE {moeda_br(diferenca)}"
+        log(f"  Vl. Bruto do cabeçalho....: {moeda_br(bruto)}  -> {status}")
     if dados["nao_reconhecidas"]:
-        print(f"  ATENÇÃO: {len(dados['nao_reconhecidas'])} linha(s) não reconhecida(s) "
-              f"- veja a aba 'Conferência'.")
-    print(f"  EXCEL GERADO: {caminho_saida}")
-    return caminho_saida
+        log(f"  ATENÇÃO: {len(dados['nao_reconhecidas'])} linha(s) não reconhecida(s) "
+            f"- veja a aba 'Conferência'.")
+    log(f"  EXCEL GERADO: {caminho_saida}")
+    return {
+        "saida": caminho_saida,
+        "confere": confere,
+        "nao_reconhecidas": len(dados["nao_reconhecidas"]),
+    }
 
 
-def listar_pdfs(argumentos):
+def listar_pdfs(argumentos, log=print):
     arquivos = []
     for item in argumentos:
         item = item.strip().strip('"')
@@ -792,57 +802,285 @@ def listar_pdfs(argumentos):
         elif os.path.isfile(item) and item.lower().endswith(".pdf"):
             arquivos.append(item)
         else:
-            print(f"Ignorado (não é PDF/pasta válida): {item}")
+            log(f"Ignorado (não é PDF/pasta válida): {item}")
     return arquivos
 
 
-def selecionar_pdfs_interativo():
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
+def converter_lista(arquivos, log=print, ao_avancar=None):
+    gerados = 0
+    alertas = 0
+    for indice, caminho_pdf in enumerate(arquivos, start=1):
+        try:
+            resultado = converter_pdf(caminho_pdf, log)
+            gerados += 1
+            if resultado["confere"] is False or resultado["nao_reconhecidas"]:
+                alertas += 1
+        except Exception as erro:
+            log(f"  ERRO ao converter {caminho_pdf}: {erro}")
+        if ao_avancar:
+            ao_avancar(indice, len(arquivos))
+    log("=" * 60)
+    log(f"Concluído: {gerados} de {len(arquivos)} arquivo(s) convertido(s).")
+    if alertas:
+        log(f"Atenção: {alertas} arquivo(s) com diferença ou linhas não reconhecidas.")
+    return gerados, alertas
 
-        raiz = tk.Tk()
-        raiz.withdraw()
-        raiz.attributes("-topmost", True)
+
+# ----------------------------------------------------------------------------
+# Interface gráfica (tkinter)
+# ----------------------------------------------------------------------------
+def abrir_no_sistema(caminho):
+    if sys.platform.startswith("win"):
+        os.startfile(caminho)
+    elif sys.platform == "darwin":
+        import subprocess
+        subprocess.Popen(["open", caminho])
+    else:
+        import subprocess
+        subprocess.Popen(["xdg-open", caminho])
+
+
+def iniciar_interface():
+    import queue
+    import threading
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+    from tkinter.scrolledtext import ScrolledText
+
+    janela = tk.Tk()
+    janela.title("Unimed - Conversor de Demonstrativo PDF para Excel")
+    janela.geometry("900x620")
+    janela.minsize(720, 480)
+
+    fila = queue.Queue()
+    arquivos = []
+    estado = {"rodando": False, "ultima_pasta": ""}
+
+    # --- Topo: botões de seleção ---
+    quadro_botoes = ttk.Frame(janela, padding=(10, 10, 10, 0))
+    quadro_botoes.pack(fill="x")
+
+    # --- Lista de arquivos ---
+    quadro_lista = ttk.LabelFrame(janela, text="PDFs selecionados", padding=8)
+    quadro_lista.pack(fill="both", expand=False, padx=10, pady=8)
+    lista = tk.Listbox(quadro_lista, height=8, selectmode="extended")
+    barra_lista = ttk.Scrollbar(quadro_lista, orient="vertical", command=lista.yview)
+    lista.configure(yscrollcommand=barra_lista.set)
+    lista.pack(side="left", fill="both", expand=True)
+    barra_lista.pack(side="right", fill="y")
+
+    rotulo_qtd = ttk.Label(janela, text="0 arquivo(s) selecionado(s)")
+    rotulo_qtd.pack(anchor="w", padx=12)
+
+    # --- Progresso ---
+    quadro_prog = ttk.Frame(janela, padding=(10, 6))
+    quadro_prog.pack(fill="x")
+    progresso = ttk.Progressbar(quadro_prog, mode="determinate")
+    progresso.pack(side="left", fill="x", expand=True)
+    rotulo_prog = ttk.Label(quadro_prog, text="", width=12, anchor="e")
+    rotulo_prog.pack(side="right", padx=(8, 0))
+
+    # --- Log ---
+    quadro_log = ttk.LabelFrame(janela, text="Resultado", padding=8)
+    quadro_log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+    texto_log = ScrolledText(quadro_log, height=12, font=("Consolas", 9), state="disabled")
+    texto_log.pack(fill="both", expand=True)
+    texto_log.tag_configure("ok", foreground="#1E7B34")
+    texto_log.tag_configure("erro", foreground="#C00000")
+    texto_log.tag_configure("aviso", foreground="#B36B00")
+
+    def atualizar_lista():
+        lista.delete(0, "end")
+        for caminho in arquivos:
+            lista.insert("end", caminho)
+        rotulo_qtd.config(text=f"{len(arquivos)} arquivo(s) selecionado(s)")
+
+    def adicionar(caminhos):
+        for caminho in caminhos:
+            caminho = os.path.normpath(caminho)
+            if caminho not in arquivos:
+                arquivos.append(caminho)
+        if caminhos:
+            estado["ultima_pasta"] = os.path.dirname(os.path.normpath(caminhos[-1]))
+        atualizar_lista()
+
+    def selecionar_pdfs():
         selecionados = filedialog.askopenfilenames(
             title="Selecione o(s) PDF(s) do Demonstrativo Unimed",
+            initialdir=estado["ultima_pasta"] or None,
             filetypes=[("Arquivos PDF", "*.pdf"), ("Todos os arquivos", "*.*")],
         )
-        raiz.destroy()
-        return list(selecionados)
-    except Exception:
-        caminho = input("Informe o caminho do PDF ou da pasta com PDFs: ").strip().strip('"')
-        return [caminho] if caminho else []
+        adicionar(list(selecionados))
+
+    def selecionar_pasta():
+        pasta = filedialog.askdirectory(
+            title="Selecione a pasta com os PDFs",
+            initialdir=estado["ultima_pasta"] or None,
+        )
+        if not pasta:
+            return
+        encontrados = listar_pdfs([pasta], escrever_log)
+        if not encontrados:
+            messagebox.showinfo("Nenhum PDF", "Não há arquivos PDF nessa pasta.")
+            return
+        adicionar(encontrados)
+        estado["ultima_pasta"] = os.path.normpath(pasta)
+
+    def remover_selecionados():
+        for indice in reversed(lista.curselection()):
+            del arquivos[indice]
+        atualizar_lista()
+
+    def limpar():
+        arquivos.clear()
+        atualizar_lista()
+
+    def escrever_log(mensagem):
+        fila.put(("log", mensagem))
+
+    def inserir_no_log(mensagem):
+        tag = None
+        if "-> OK" in mensagem or mensagem.startswith("Concluído"):
+            tag = "ok"
+        elif "ERRO" in mensagem or "DIFERENÇA" in mensagem:
+            tag = "erro"
+        elif "ATENÇÃO" in mensagem or "Atenção" in mensagem or "Aviso" in mensagem:
+            tag = "aviso"
+        texto_log.configure(state="normal")
+        texto_log.insert("end", mensagem + "\n", tag)
+        texto_log.see("end")
+        texto_log.configure(state="disabled")
+
+    def ao_avancar(atual, total):
+        fila.put(("progresso", (atual, total)))
+
+    def trabalho(lista_arquivos):
+        try:
+            gerados, alertas = converter_lista(lista_arquivos, escrever_log, ao_avancar)
+            fila.put(("fim", (gerados, len(lista_arquivos), alertas)))
+        except Exception as erro:
+            fila.put(("log", f"ERRO inesperado: {erro}"))
+            fila.put(("fim", (0, len(lista_arquivos), 0)))
+
+    def converter():
+        if estado["rodando"]:
+            return
+        if not arquivos:
+            messagebox.showwarning("Atenção", "Selecione pelo menos um PDF ou uma pasta.")
+            return
+        estado["rodando"] = True
+        for botao in botoes_bloqueaveis:
+            botao.configure(state="disabled")
+        progresso.configure(maximum=len(arquivos), value=0)
+        rotulo_prog.config(text=f"0 / {len(arquivos)}")
+        threading.Thread(target=trabalho, args=(list(arquivos),), daemon=True).start()
+
+    def abrir_pasta():
+        pasta = estado["ultima_pasta"]
+        if not pasta and arquivos:
+            pasta = os.path.dirname(arquivos[0])
+        if pasta and os.path.isdir(pasta):
+            try:
+                abrir_no_sistema(pasta)
+            except Exception as erro:
+                messagebox.showerror("Erro", f"Não foi possível abrir a pasta:\n{erro}")
+        else:
+            messagebox.showinfo("Pasta", "Nenhuma pasta selecionada ainda.")
+
+    def processar_fila():
+        try:
+            while True:
+                tipo, conteudo = fila.get_nowait()
+                if tipo == "log":
+                    inserir_no_log(conteudo)
+                elif tipo == "progresso":
+                    atual, total = conteudo
+                    progresso.configure(value=atual)
+                    rotulo_prog.config(text=f"{atual} / {total}")
+                elif tipo == "fim":
+                    gerados, total, alertas = conteudo
+                    estado["rodando"] = False
+                    for botao in botoes_bloqueaveis:
+                        botao.configure(state="normal")
+                    mensagem = f"{gerados} de {total} arquivo(s) convertido(s)."
+                    if alertas:
+                        mensagem += (f"\n\n{alertas} arquivo(s) com diferença ou linhas não "
+                                     f"reconhecidas. Confira a aba 'Conferência' desses Excel.")
+                        messagebox.showwarning("Concluído com avisos", mensagem)
+                    else:
+                        messagebox.showinfo("Concluído", mensagem)
+        except queue.Empty:
+            pass
+        janela.after(100, processar_fila)
+
+    def ao_fechar():
+        if estado["rodando"] and not messagebox.askyesno(
+            "Sair", "A conversão ainda está em andamento. Deseja sair mesmo assim?"
+        ):
+            return
+        janela.destroy()
+
+    btn_pdfs = ttk.Button(quadro_botoes, text="Selecionar PDFs...", command=selecionar_pdfs)
+    btn_pasta = ttk.Button(quadro_botoes, text="Selecionar pasta...", command=selecionar_pasta)
+    btn_remover = ttk.Button(quadro_botoes, text="Remover selecionados", command=remover_selecionados)
+    btn_limpar = ttk.Button(quadro_botoes, text="Limpar lista", command=limpar)
+    btn_converter = ttk.Button(quadro_botoes, text="CONVERTER PARA EXCEL", command=converter)
+    btn_abrir = ttk.Button(quadro_botoes, text="Abrir pasta", command=abrir_pasta)
+    for botao in (btn_pdfs, btn_pasta, btn_remover, btn_limpar):
+        botao.pack(side="left", padx=(0, 6))
+    btn_abrir.pack(side="right")
+    btn_converter.pack(side="right", padx=(0, 6))
+    botoes_bloqueaveis = [btn_pdfs, btn_pasta, btn_remover, btn_limpar, btn_converter]
+
+    lista.bind("<Delete>", lambda evento: remover_selecionados())
+    janela.protocol("WM_DELETE_WINDOW", ao_fechar)
+
+    # PDFs/pastas passados ao abrir (ex.: arrastados sobre o .py) já entram na lista
+    if sys.argv[1:]:
+        adicionar(listar_pdfs(sys.argv[1:], escrever_log))
+
+    inserir_no_log("Selecione os PDFs ou uma pasta e clique em 'CONVERTER PARA EXCEL'.")
+    janela.after(100, processar_fila)
+    janela.mainloop()
 
 
-def main():
-    argumentos = sys.argv[1:]
+# ----------------------------------------------------------------------------
+# Modo linha de comando (sem janela): python pdf_unimed_para_excel.py --console <pdfs/pastas>
+# ----------------------------------------------------------------------------
+def main_console(argumentos):
     if not argumentos:
-        argumentos = selecionar_pdfs_interativo()
-
+        caminho = input("Informe o caminho do PDF ou da pasta com PDFs: ").strip().strip('"')
+        argumentos = [caminho] if caminho else []
     arquivos = listar_pdfs(argumentos)
     if not arquivos:
         print("Nenhum arquivo PDF selecionado.")
         return
-
-    gerados = 0
-    for caminho_pdf in arquivos:
-        try:
-            converter_pdf(caminho_pdf)
-            gerados += 1
-        except Exception as erro:
-            print(f"  ERRO ao converter {caminho_pdf}: {erro}")
-
-    print("=" * 60)
-    print(f"Concluído: {gerados} de {len(arquivos)} arquivo(s) convertido(s).")
+    converter_lista(arquivos)
 
 
-if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        if not sys.argv[1:] or sys.stdin.isatty():
+def main():
+    argumentos = sys.argv[1:]
+    if "--console" in argumentos:
+        argumentos = [a for a in argumentos if a != "--console"]
+        main_console(argumentos)
+        if sys.stdin.isatty():
             try:
                 input("\nPressione ENTER para fechar...")
             except EOFError:
                 pass
+        return
+    try:
+        iniciar_interface()
+    except ImportError:
+        print("tkinter não está disponível. Usando o modo console.")
+        main_console(argumentos)
+    except Exception as erro:
+        if "display" in str(erro).lower():
+            print("Não foi possível abrir a janela. Usando o modo console.")
+            main_console(argumentos)
+        else:
+            raise
+
+
+if __name__ == "__main__":
+    main()
